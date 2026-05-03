@@ -1,7 +1,10 @@
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import Fastify from 'fastify';
 import { env } from './config/env.js';
+import { registerAgentOptionsRoutes } from './routes/agent-options.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { registerSessionRoutes } from './routes/sessions.js';
 import { registerSystemRoutes } from './routes/system.js';
 import { registerWorkspaceRoutes } from './routes/workspaces.js';
 
@@ -23,9 +26,18 @@ export async function buildApp() {
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
   });
 
+  await app.register(multipart, {
+    limits: {
+      files: 5,
+      fileSize: 10 * 1024 * 1024
+    }
+  });
+
   await registerHealthRoutes(app);
   await registerSystemRoutes(app);
   await registerWorkspaceRoutes(app);
+  await registerAgentOptionsRoutes(app);
+  await registerSessionRoutes(app);
 
   return app;
 }

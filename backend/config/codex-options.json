@@ -1,0 +1,38 @@
+{
+  "models": [
+    {
+      "id": "gpt-5.5",
+      "label": "GPT-5.5"
+    },
+    {
+      "id": "gpt-5.4",
+      "label": "GPT-5.4"
+    }
+  ],
+  "reasoningEfforts": [
+    {
+      "id": "minimal",
+      "label": "Minimal"
+    },
+    {
+      "id": "low",
+      "label": "Low"
+    },
+    {
+      "id": "medium",
+      "label": "Medium"
+    },
+    {
+      "id": "high",
+      "label": "High"
+    },
+    {
+      "id": "xhigh",
+      "label": "XHigh"
+    }
+  ],
+  "defaults": {
+    "model": "gpt-5.5",
+    "reasoningEffort": "medium"
+  }
+}

@@ -36,6 +36,7 @@ model Session {
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   messages  Message[]
+  turns     Turn[]
 
   @@index([workspaceId])
   @@index([provider])
@@ -46,6 +47,7 @@ model Message {
   id        String   @id @default(cuid())
   role      String
   content   String
+  taskTitle String?
   sessionId String
   createdAt DateTime @default(now())
 
@@ -53,4 +55,37 @@ model Message {
 
   @@index([sessionId])
   @@index([createdAt])
+}
+
+model Turn {
+  id               String   @id @default(cuid())
+  prompt           String
+  taskTitle        String?
+  assistantContent String?
+  sessionId        String
+  userMessageId    String?
+  createdAt        DateTime @default(now())
+  completedAt      DateTime?
+
+  session       Session        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  modifiedFiles ModifiedFile[]
+
+  @@index([sessionId])
+  @@index([createdAt])
+}
+
+model ModifiedFile {
+  id        String   @id @default(cuid())
+  path      String
+  kind      String
+  beforeContent String?
+  afterContent  String?
+  content   String?
+  turnId    String
+  createdAt DateTime @default(now())
+
+  turn Turn @relation(fields: [turnId], references: [id], onDelete: Cascade)
+
+  @@index([turnId])
+  @@index([path])
 }

@@ -32,6 +32,7 @@ pnpm-debug.log*
 *.pid
 *.seed
 *.pid.lock
+backend/uploads/
 
 # Prisma local databases
 **/prisma/dev.db
