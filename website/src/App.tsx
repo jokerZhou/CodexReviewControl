@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { 
   Terminal, 
   Search, 
@@ -38,28 +38,203 @@ const splitLines = (text: string | null | undefined) => (text || '').replace(/\r
 const reviewPaneText = (text: string | null | undefined, emptyLabel: string) => text && text.length > 0 ? text : emptyLabel;
 const hasReviewSnapshot = (text: string | null | undefined) => text !== null && text !== undefined && text.length > 0;
 
-const renderDiffLines = (beforeText: string | null | undefined, afterText: string | null | undefined) => {
+type DiffOp = { kind: 'same' | 'add' | 'delete'; text: string };
+
+const buildLineDiffOps = (beforeText: string | null | undefined, afterText: string | null | undefined) => {
   const beforeLines = splitLines(beforeText);
   const afterLines = splitLines(afterText);
-  const maxLines = Math.max(beforeLines.length, afterLines.length);
-  const rows: Array<{ before: string; after: string; kind: 'add' | 'delete' | 'update' | 'same' }> = [];
+  const table = Array.from({ length: beforeLines.length + 1 }, () => Array(afterLines.length + 1).fill(0));
 
-  for (let i = 0; i < maxLines; i += 1) {
-    const before = beforeLines[i] ?? '';
-    const after = afterLines[i] ?? '';
-
-    if (before === after) {
-      rows.push({ before, after, kind: 'same' });
-    } else if (before && after) {
-      rows.push({ before, after, kind: 'update' });
-    } else if (before && !after) {
-      rows.push({ before, after: '', kind: 'delete' });
-    } else if (!before && after) {
-      rows.push({ before: '', after, kind: 'add' });
+  for (let i = beforeLines.length - 1; i >= 0; i -= 1) {
+    for (let j = afterLines.length - 1; j >= 0; j -= 1) {
+      table[i][j] = beforeLines[i] === afterLines[j]
+        ? table[i + 1][j + 1] + 1
+        : Math.max(table[i + 1][j], table[i][j + 1]);
     }
   }
 
+  const ops: DiffOp[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < beforeLines.length && j < afterLines.length) {
+    if (beforeLines[i] === afterLines[j]) {
+      ops.push({ kind: 'same', text: beforeLines[i] });
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    if (table[i + 1][j] >= table[i][j + 1]) {
+      ops.push({ kind: 'delete', text: beforeLines[i] });
+      i += 1;
+    } else {
+      ops.push({ kind: 'add', text: afterLines[j] });
+      j += 1;
+    }
+  }
+
+  while (i < beforeLines.length) {
+    ops.push({ kind: 'delete', text: beforeLines[i] });
+    i += 1;
+  }
+
+  while (j < afterLines.length) {
+    ops.push({ kind: 'add', text: afterLines[j] });
+    j += 1;
+  }
+
+  return ops;
+};
+
+const renderCompareRows = (beforeText: string | null | undefined, afterText: string | null | undefined) => {
+  const rows: Array<{
+    before: string;
+    after: string;
+    kind: 'add' | 'delete' | 'update' | 'same';
+    beforeLineNumber: number | null;
+    afterLineNumber: number | null;
+  }> = [];
+  const pendingDeletes: Array<{ text: string; lineNumber: number }> = [];
+  const pendingAdds: Array<{ text: string; lineNumber: number }> = [];
+  let beforeLineNumber = 1;
+  let afterLineNumber = 1;
+
+  const flushChanges = () => {
+    const pairedLength = Math.min(pendingDeletes.length, pendingAdds.length);
+    for (let i = 0; i < pairedLength; i += 1) {
+      rows.push({
+        before: pendingDeletes[i].text,
+        after: pendingAdds[i].text,
+        kind: 'update',
+        beforeLineNumber: pendingDeletes[i].lineNumber,
+        afterLineNumber: pendingAdds[i].lineNumber
+      });
+    }
+    for (let i = pairedLength; i < pendingDeletes.length; i += 1) {
+      rows.push({
+        before: pendingDeletes[i].text,
+        after: '',
+        kind: 'delete',
+        beforeLineNumber: pendingDeletes[i].lineNumber,
+        afterLineNumber: null
+      });
+    }
+    for (let i = pairedLength; i < pendingAdds.length; i += 1) {
+      rows.push({
+        before: '',
+        after: pendingAdds[i].text,
+        kind: 'add',
+        beforeLineNumber: null,
+        afterLineNumber: pendingAdds[i].lineNumber
+      });
+    }
+    pendingDeletes.length = 0;
+    pendingAdds.length = 0;
+  };
+
+  buildLineDiffOps(beforeText, afterText).forEach((op) => {
+    if (op.kind === 'same') {
+      flushChanges();
+      rows.push({
+        before: op.text,
+        after: op.text,
+        kind: 'same',
+        beforeLineNumber,
+        afterLineNumber
+      });
+      beforeLineNumber += 1;
+      afterLineNumber += 1;
+      return;
+    }
+    if (op.kind === 'delete') {
+      pendingDeletes.push({ text: op.text, lineNumber: beforeLineNumber });
+      beforeLineNumber += 1;
+    }
+    if (op.kind === 'add') {
+      pendingAdds.push({ text: op.text, lineNumber: afterLineNumber });
+      afterLineNumber += 1;
+    }
+  });
+
+  flushChanges();
   return rows;
+};
+
+const renderAnnotatedCurrentLines = (beforeText: string | null | undefined, afterText: string | null | undefined) => {
+  const rows: Array<{ id: string; kind: 'same' | 'add' | 'delete' | 'update'; text: string; beforeText?: string; lineNumber: number | null }> = [];
+  const pendingDeletes: string[] = [];
+  const pendingAdds: string[] = [];
+  let lineNumber = 1;
+  let rowIndex = 0;
+
+  const nextId = () => {
+    rowIndex += 1;
+    return `review-change-${rowIndex}`;
+  };
+
+  const flushChanges = () => {
+    const pairedLength = Math.min(pendingDeletes.length, pendingAdds.length);
+    for (let i = 0; i < pairedLength; i += 1) {
+      rows.push({ id: nextId(), kind: 'update', text: pendingAdds[i], beforeText: pendingDeletes[i], lineNumber });
+      lineNumber += 1;
+    }
+    for (let i = pairedLength; i < pendingDeletes.length; i += 1) {
+      rows.push({ id: nextId(), kind: 'delete', text: pendingDeletes[i], lineNumber: null });
+    }
+    for (let i = pairedLength; i < pendingAdds.length; i += 1) {
+      rows.push({ id: nextId(), kind: 'add', text: pendingAdds[i], lineNumber });
+      lineNumber += 1;
+    }
+    pendingDeletes.length = 0;
+    pendingAdds.length = 0;
+  };
+
+  buildLineDiffOps(beforeText, afterText).forEach((op) => {
+    if (op.kind === 'same') {
+      flushChanges();
+      rows.push({ id: nextId(), kind: 'same', text: op.text, lineNumber });
+      lineNumber += 1;
+      return;
+    }
+    if (op.kind === 'delete') pendingDeletes.push(op.text);
+    if (op.kind === 'add') pendingAdds.push(op.text);
+  });
+
+  flushChanges();
+  return rows;
+};
+
+type AnnotatedRow = ReturnType<typeof renderAnnotatedCurrentLines>[number];
+
+const groupAdjacentChanges = (rows: AnnotatedRow[]) => {
+  const groupByRowId = new Map<string, string>();
+  const groups: Array<{ id: string; rows: AnnotatedRow[]; kind: 'add' | 'delete' | 'update' }> = [];
+  let currentGroup: { id: string; rows: AnnotatedRow[]; kind: 'add' | 'delete' | 'update' } | null = null;
+
+  rows.forEach((row) => {
+    if (row.kind === 'same') {
+      currentGroup = null;
+      return;
+    }
+
+    if (!currentGroup) {
+      currentGroup = {
+        id: `change-group-${groups.length + 1}`,
+        rows: [],
+        kind: row.kind
+      };
+      groups.push(currentGroup);
+    }
+
+    if (currentGroup.kind !== row.kind) {
+      currentGroup.kind = 'update';
+    }
+    currentGroup.rows.push(row);
+    groupByRowId.set(row.id, currentGroup.id);
+  });
+
+  return { groups, groupByRowId };
 };
 
 const reviewDiffUnavailableText = (file: ModifiedFile | undefined) => {
@@ -1241,6 +1416,12 @@ const StatCard = ({ label, value, color, progress, subtext, indicator }: any) =>
 const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void }) => {
   const [detailTurn, setDetailTurn] = useState(turn);
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
+  const [reviewMode, setReviewMode] = useState<'compare' | 'annotated'>('annotated');
+  const [activeChangeRowId, setActiveChangeRowId] = useState<string | null>(null);
+  const [changeNotes, setChangeNotes] = useState<Record<string, string>>({});
+  const [reviewedChanges, setReviewedChanges] = useState<Record<string, boolean>>({});
+  const annotatedScrollRef = useRef<HTMLDivElement | null>(null);
+  const ignoreNextAnnotatedScrollRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1270,7 +1451,39 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
     };
   }, [turn]);
 
+  useEffect(() => {
+    setReviewMode('annotated');
+    setActiveChangeRowId(null);
+    annotatedScrollRef.current?.scrollTo({ top: 0 });
+  }, [selectedFileIndex]);
+
   const selectedFile = detailTurn.modifiedFiles[selectedFileIndex];
+  const annotatedRows = useMemo(() => {
+    if (!selectedFile || selectedFile.status !== 'M' || reviewDiffUnavailableText(selectedFile)) return [];
+    return renderAnnotatedCurrentLines(selectedFile.beforeContent, selectedFile.afterContent);
+  }, [selectedFile]);
+  const changeGroups = useMemo(() => groupAdjacentChanges(annotatedRows), [annotatedRows]);
+  const changeStateKey = (groupId: string) => `${turn.id}:${selectedFile?.name ?? 'unknown'}:${groupId}`;
+  const jumpToAnnotatedGroup = (groupId: string) => {
+    const group = changeGroups.groups.find((item) => item.id === groupId);
+    const firstRow = group?.rows[0];
+    const container = annotatedScrollRef.current;
+    const target = firstRow ? document.getElementById(firstRow.id) : null;
+    if (!container || !target) return;
+    setActiveChangeRowId(groupId);
+    ignoreNextAnnotatedScrollRef.current = true;
+    container.scrollTo({
+      top: target.offsetTop - container.offsetTop - 24,
+      behavior: 'smooth'
+    });
+  };
+  const handleAnnotatedScroll = () => {
+    if (ignoreNextAnnotatedScrollRef.current) {
+      ignoreNextAnnotatedScrollRef.current = false;
+      return;
+    }
+    setActiveChangeRowId(null);
+  };
 
   return (
     <motion.div
@@ -1324,12 +1537,142 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
 
               <div className="col-span-8 flex min-h-0 flex-col overflow-hidden">
                 <div className="border-b border-slate-800 px-4 py-3">
-                  <div className="flex items-center gap-3">
-                    <span className={`text-xs font-mono font-bold ${selectedFile?.statusColor}`}>{selectedFile?.status}</span>
-                    <span className="truncate text-xs font-mono text-slate-300">{selectedFile?.name}</span>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <span className={`text-xs font-mono font-bold ${selectedFile?.statusColor}`}>{selectedFile?.status}</span>
+                      <span className="truncate text-xs font-mono text-slate-300">{selectedFile?.name}</span>
+                    </div>
+                    <div className="flex shrink-0 overflow-hidden rounded border border-slate-800 bg-slate-950 p-0.5">
+                      <button
+                        onClick={() => setReviewMode('compare')}
+                        className={`px-3 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                          reviewMode === 'compare' ? 'bg-blue-500/20 text-blue-300' : 'text-slate-500 hover:text-slate-300'
+                        }`}
+                      >
+                        Compare
+                      </button>
+                      <button
+                        onClick={() => setReviewMode('annotated')}
+                        className={`px-3 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                          reviewMode === 'annotated' ? 'bg-blue-500/20 text-blue-300' : 'text-slate-500 hover:text-slate-300'
+                        }`}
+                      >
+                        Current
+                      </button>
+                    </div>
                   </div>
                 </div>
-                {selectedFile?.status === 'A' ? (
+                {reviewMode === 'annotated' && selectedFile?.status === 'M' ? (
+                  <div className="flex min-h-0 flex-1 bg-slate-950/40">
+                    <div ref={annotatedScrollRef} onScroll={handleAnnotatedScroll} className="min-w-0 flex-1 overflow-y-auto p-4 hide-scrollbar">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-blue-400">Current Code With Changes</div>
+                        <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest">
+                          <span className="text-green-300">Added</span>
+                          <span className="text-yellow-300">Modified</span>
+                          <span className="text-red-300">Deleted</span>
+                        </div>
+                      </div>
+                      <div className="font-mono text-xs leading-relaxed">
+                        {reviewDiffUnavailableText(selectedFile) ? (
+                          <div className="py-10 text-center text-[11px] font-bold uppercase tracking-widest text-slate-600">
+                            {reviewDiffUnavailableText(selectedFile)}
+                          </div>
+                        ) : (
+                          annotatedRows.map((row) => {
+                            const groupId = changeGroups.groupByRowId.get(row.id);
+                            const group = groupId ? changeGroups.groups.find((item) => item.id === groupId) : null;
+                            const isGroupFirstRow = group?.rows[0]?.id === row.id;
+                            const isActiveGroup = activeChangeRowId === groupId;
+                            const stateKey = groupId ? changeStateKey(groupId) : '';
+
+                            return (
+                              <div
+                                id={row.id}
+                                key={row.id}
+                                className={`group flex scroll-mt-6 items-start border-l-2 px-2 py-0.5 transition-all duration-300 ${
+                                  isActiveGroup ? 'relative z-10 scale-[1.015] shadow-[0_0_0_1px_rgba(96,165,250,0.65),0_0_28px_rgba(59,130,246,0.35)]' : ''
+                                } ${
+                                  row.kind === 'add'
+                                    ? isActiveGroup ? 'border-green-200 bg-green-400/25 text-green-50' : 'border-green-400 bg-green-500/10 text-green-100'
+                                    : row.kind === 'delete'
+                                      ? isActiveGroup ? 'border-red-200 bg-red-400/25 text-red-50' : 'border-red-400 bg-red-500/10 text-red-100'
+                                      : row.kind === 'update'
+                                        ? isActiveGroup ? 'border-yellow-100 bg-yellow-300/25 text-yellow-50' : 'border-yellow-300 bg-yellow-400/10 text-yellow-100'
+                                        : 'border-transparent text-slate-400'
+                                }`}
+                                title={row.kind === 'update' && row.beforeText ? `Before: ${row.beforeText}` : undefined}
+                              >
+                                <span className="mr-3 w-10 shrink-0 text-right text-slate-600">{row.lineNumber ?? '-'}</span>
+                                <span className="mr-3 w-10 shrink-0 font-bold uppercase">
+                                  {row.kind === 'add' ? 'ADD' : row.kind === 'delete' ? 'DEL' : row.kind === 'update' ? 'MOD' : ''}
+                                </span>
+                                <span className={`${row.kind === 'delete' ? 'line-through decoration-red-300/70' : ''} flex-1 whitespace-pre-wrap`}>
+                                  {row.text || ' '}
+                                </span>
+                                {row.kind === 'update' && row.beforeText ? (
+                                  <span className="ml-4 hidden max-w-[36%] shrink-0 truncate text-red-200/80 xl:block">
+                                    was: {row.beforeText || ' '}
+                                  </span>
+                                ) : null}
+                                {groupId ? (
+                                  <span className={`ml-3 flex w-56 shrink-0 items-center gap-2 transition-opacity ${
+                                    isGroupFirstRow ? 'opacity-80 group-hover:opacity-100' : 'pointer-events-none invisible'
+                                  }`}>
+                                    <input
+                                      value={changeNotes[stateKey] ?? ''}
+                                      onChange={(event) => setChangeNotes((current) => ({
+                                        ...current,
+                                        [stateKey]: event.target.value
+                                      }))}
+                                      placeholder="备注"
+                                      className="min-w-0 flex-1 rounded border border-slate-800 bg-slate-950/80 px-2 py-1 text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-blue-500"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => setReviewedChanges((current) => ({
+                                        ...current,
+                                        [stateKey]: !current[stateKey]
+                                      }))}
+                                      className={`shrink-0 rounded border px-2 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+                                        reviewedChanges[stateKey]
+                                          ? 'border-green-400/50 bg-green-500/15 text-green-200'
+                                          : 'border-slate-700 bg-slate-900 text-slate-400 hover:border-blue-500 hover:text-blue-300'
+                                      }`}
+                                    >
+                                      {reviewedChanges[stateKey] ? '已审' : '审核'}
+                                    </button>
+                                  </span>
+                                ) : null}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                    {changeGroups.groups.length > 0 && (
+                      <div className="flex w-5 shrink-0 flex-col items-center gap-1 border-l border-slate-800 bg-slate-950/70 py-3">
+                        {changeGroups.groups.map((group) => (
+                          <button
+                            key={`nav-${group.id}`}
+                            onClick={() => jumpToAnnotatedGroup(group.id)}
+                            className={`h-3 w-2 rounded-sm transition-all hover:scale-x-150 ${
+                              activeChangeRowId === group.id ? 'h-5 w-3 shadow-[0_0_10px_rgba(96,165,250,0.8)]' : ''
+                            } ${
+                              group.kind === 'add'
+                                ? 'bg-green-400/80'
+                                : group.kind === 'delete'
+                                  ? 'bg-red-400/80'
+                                  : 'bg-yellow-300/80'
+                            }`}
+                            title={`${group.kind.toUpperCase()} ${group.rows.length} lines`}
+                            aria-label={`Jump to ${group.kind} change group`}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : selectedFile?.status === 'A' ? (
                   <div className="min-h-0 flex-1 overflow-y-auto bg-slate-950/40 p-4 hide-scrollbar">
                     <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-blue-400">Added Content</div>
                     <pre className="whitespace-pre-wrap text-xs leading-relaxed text-green-100">
@@ -1361,10 +1704,20 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                       <div className="border-r border-slate-800 overflow-y-auto bg-slate-950/40 p-3 hide-scrollbar">
                         <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-600">Before</div>
                         <pre className="whitespace-pre-wrap text-xs leading-relaxed text-slate-400">
-                          {splitLines(reviewPaneText(selectedFile?.beforeContent, 'No before snapshot available.')).map((line, index) => (
-                            <div key={index} className="flex">
-                              <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{index + 1}</span>
-                              <span className="flex-1 bg-transparent">{line || ' '}</span>
+                          {reviewDiffUnavailableText(selectedFile) ? (
+                            splitLines(reviewPaneText(selectedFile?.beforeContent, 'No before snapshot available.')).map((line, index) => (
+                              <div key={index} className="flex">
+                                <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{index + 1}</span>
+                                <span className="flex-1 bg-transparent">{line || ' '}</span>
+                              </div>
+                            ))
+                          ) : renderCompareRows(selectedFile?.beforeContent, selectedFile?.afterContent)
+                            .filter((row) => row.kind !== 'same')
+                            .map((row, index) => (
+                            <div key={index} className={`flex ${row.kind === 'delete' || row.kind === 'update' ? 'bg-red-500/10 text-red-200' : 'text-slate-700'}`}>
+                              <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{row.beforeLineNumber ?? '-'}</span>
+                              <span className="mr-2 w-3 shrink-0 text-red-300">{row.before ? '-' : ''}</span>
+                              <span className="flex-1">{row.before || ' '}</span>
                             </div>
                           ))}
                         </pre>
@@ -1372,37 +1725,26 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                       <div className="overflow-y-auto bg-slate-950/40 p-3 hide-scrollbar">
                         <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-600">After</div>
                         <pre className="whitespace-pre-wrap text-xs leading-relaxed text-slate-300">
-                          {splitLines(reviewPaneText(selectedFile?.afterContent, 'No after snapshot available.')).map((line, index) => (
-                            <div key={index} className="flex">
-                              <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{index + 1}</span>
-                              <span className="flex-1 bg-transparent">{line || ' '}</span>
+                          {reviewDiffUnavailableText(selectedFile) ? (
+                            splitLines(reviewPaneText(selectedFile?.afterContent, 'No after snapshot available.')).map((line, index) => (
+                              <div key={index} className="flex">
+                                <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{index + 1}</span>
+                                <span className="flex-1 bg-transparent">{line || ' '}</span>
+                              </div>
+                            ))
+                          ) : renderCompareRows(selectedFile?.beforeContent, selectedFile?.afterContent)
+                            .filter((row) => row.kind !== 'same')
+                            .map((row, index) => (
+                            <div key={index} className={`flex ${row.kind === 'add' || row.kind === 'update' ? 'bg-green-500/10 text-green-200' : 'text-slate-700'}`}>
+                              <span className="mr-3 w-8 shrink-0 text-right text-slate-600">{row.afterLineNumber ?? '-'}</span>
+                              <span className="mr-2 w-3 shrink-0 text-green-300">{row.after ? '+' : ''}</span>
+                              <span className="flex-1">{row.after || ' '}</span>
                             </div>
                           ))}
                         </pre>
                       </div>
                     </div>
 
-                    <div className="border-t border-slate-800 p-3">
-                      <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-600">Line Diff</div>
-                      <div className="max-h-72 overflow-y-auto rounded border border-slate-800 bg-slate-950/60 p-3 font-mono text-xs hide-scrollbar">
-                        {reviewDiffUnavailableText(selectedFile) ? (
-                          <div className="py-6 text-center text-[11px] font-bold uppercase tracking-widest text-slate-600">
-                            {reviewDiffUnavailableText(selectedFile)}
-                          </div>
-                        ) : (
-                          renderDiffLines(selectedFile?.beforeContent, selectedFile?.afterContent).map((row, index) => (
-                            <div key={index} className="grid grid-cols-2 gap-4 border-b border-slate-800/50 py-1 last:border-b-0">
-                              <div className={`${row.kind === 'delete' || row.kind === 'update' ? 'bg-red-500/10 text-red-200' : 'text-slate-600'}`}>
-                                {row.before ? `- ${row.before}` : ' '}
-                              </div>
-                              <div className={`${row.kind === 'add' || row.kind === 'update' ? 'bg-green-500/10 text-green-200' : 'text-slate-600'}`}>
-                                {row.after ? `+ ${row.after}` : ' '}
-                              </div>
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    </div>
                   </>
                 )}
               </div>
