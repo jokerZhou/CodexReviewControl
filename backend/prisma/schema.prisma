@@ -9,6 +9,7 @@ datasource db {
 
 enum AgentProvider {
   CODEX
+  CODEX_CLI
   CURSOR
 }
 
@@ -30,6 +31,7 @@ model Session {
   id          String        @id @default(cuid())
   name        String
   provider    AgentProvider
+  externalSessionId String?
   workspaceId String
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
@@ -69,6 +71,7 @@ model Turn {
 
   session       Session        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   modifiedFiles ModifiedFile[]
+  reviewNotes   ReviewChangeNote[]
 
   @@index([sessionId])
   @@index([createdAt])
@@ -88,4 +91,21 @@ model ModifiedFile {
 
   @@index([turnId])
   @@index([path])
+}
+
+model ReviewChangeNote {
+  id        String   @id @default(cuid())
+  turnId    String
+  filePath  String
+  groupId   String
+  note      String
+  reviewed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  turn Turn @relation(fields: [turnId], references: [id], onDelete: Cascade)
+
+  @@unique([turnId, filePath, groupId])
+  @@index([turnId])
+  @@index([filePath])
 }

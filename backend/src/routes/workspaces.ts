@@ -9,16 +9,18 @@ const createWorkspaceSchema = z.object({
 });
 
 const createSessionSchema = z.object({
-  provider: z.enum(['codex', 'cursor']),
+  provider: z.enum(['codex', 'codex-cli', 'cursor']),
   name: z.string().trim().min(1).optional()
 });
 
-const providerToDb = (provider: 'codex' | 'cursor') => {
-  return provider === 'codex' ? AgentProvider.CODEX : AgentProvider.CURSOR;
+const providerToDb = (provider: 'codex' | 'codex-cli' | 'cursor') => {
+  if (provider === 'codex') return AgentProvider.CODEX;
+  if (provider === 'codex-cli') return AgentProvider.CODEX_CLI;
+  return AgentProvider.CURSOR;
 };
 
 const providerFromDb = (provider: AgentProvider) => {
-  return provider.toLowerCase();
+  return provider === AgentProvider.CODEX_CLI ? 'codex-cli' : provider.toLowerCase();
 };
 
 export async function registerWorkspaceRoutes(app: FastifyInstance) {
@@ -104,7 +106,11 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: 'Workspace not found' });
     }
 
-    const providerLabel = body.data.provider === 'codex' ? 'Codex' : 'Cursor';
+    const providerLabel = body.data.provider === 'codex'
+      ? 'Codex SDK'
+      : body.data.provider === 'codex-cli'
+        ? 'Codex CLI'
+        : 'Cursor';
     const session = await prisma.session.create({
       data: {
         workspaceId: workspace.id,

@@ -4,6 +4,9 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { FitAddon } from '@xterm/addon-fit';
+import { Terminal as XTerm } from '@xterm/xterm';
+import '@xterm/xterm/css/xterm.css';
 import { 
   Terminal, 
   Search, 
@@ -33,6 +36,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
+const API_WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
 
 const splitLines = (text: string | null | undefined) => (text || '').replace(/\r\n/g, '\n').split('\n');
 const reviewPaneText = (text: string | null | undefined, emptyLabel: string) => text && text.length > 0 ? text : emptyLabel;
@@ -343,7 +347,7 @@ interface Turn {
   summary: string;
 }
 
-type AgentProvider = 'codex' | 'cursor';
+type AgentProvider = 'codex' | 'codex-cli' | 'cursor';
 type CodexReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AgentRunStatus = 'idle' | 'busy';
 
@@ -425,6 +429,14 @@ interface ApiModifiedFile {
   afterContent?: string | null;
 }
 
+interface ApiReviewChangeNote {
+  id: string;
+  filePath: string;
+  groupId: string;
+  note: string;
+  reviewed: boolean;
+}
+
 interface ApiTurn {
   id: string;
   prompt: string;
@@ -432,6 +444,7 @@ interface ApiTurn {
   assistantContent?: string | null;
   createdAt: string;
   modifiedFiles: ApiModifiedFile[];
+  reviewNotes?: ApiReviewChangeNote[];
 }
 
 interface PendingAttachment {
@@ -603,9 +616,14 @@ const AddProjectModal = ({ onClose, onAddProject }: { onClose: () => void, onAdd
 
 const providerMeta: Record<AgentProvider, { label: string; description: string; accent: string }> = {
   codex: {
-    label: 'Codex',
-    description: 'OpenAI Codex session for local workspace automation.',
+    label: 'Codex SDK',
+    description: 'OpenAI Codex SDK session with structured event tracking.',
     accent: 'text-blue-400 border-blue-500/40 bg-blue-500/10'
+  },
+  'codex-cli': {
+    label: 'Codex CLI',
+    description: 'Codex CLI session with resume support and snapshot-based change review.',
+    accent: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10'
   },
   cursor: {
     label: 'Cursor',
@@ -659,6 +677,105 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
         </div>
       </motion.div>
     </motion.div>
+  );
+};
+
+const CodexCliTerminal = ({ sessionId, title, providerLabel, onRunStatusChange }: { sessionId: string, title: string, providerLabel: string, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
+  const terminalRef = useRef<HTMLDivElement | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const onRunStatusChangeRef = useRef(onRunStatusChange);
+
+  useEffect(() => {
+    onRunStatusChangeRef.current = onRunStatusChange;
+  }, [onRunStatusChange]);
+
+  useEffect(() => {
+    if (!terminalRef.current) return undefined;
+
+    const terminal = new XTerm({
+      convertEol: true,
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+      fontSize: 14,
+      theme: {
+        background: '#020617',
+        foreground: '#cbd5e1',
+        cursor: '#60a5fa',
+        selectionBackground: '#1e40af66'
+      }
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(terminalRef.current);
+    fitAddon.fit();
+    terminal.focus();
+    terminal.writeln(`${providerLabel} TUI attached`);
+    terminal.writeln(`Session context: ${title}`);
+    terminal.writeln('');
+
+    const socket = new WebSocket(`${API_WS_BASE_URL}/sessions/${sessionId}/terminal`);
+    socketRef.current = socket;
+    onRunStatusChangeRef.current(sessionId, 'busy');
+
+    const sendResize = () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
+    };
+
+    socket.addEventListener('open', () => {
+      sendResize();
+    });
+    socket.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data)) as { type: string; data?: string; exitCode?: number };
+      if (message.type === 'output' && typeof message.data === 'string') {
+        terminal.write(message.data);
+      }
+      if (message.type === 'exit') {
+        terminal.writeln(`\r\n[process exited: ${message.exitCode ?? 0}]`);
+        onRunStatusChangeRef.current(sessionId, 'idle');
+      }
+    });
+    socket.addEventListener('close', () => {
+      onRunStatusChangeRef.current(sessionId, 'idle');
+    });
+    socket.addEventListener('error', () => {
+      terminal.writeln('\r\n[terminal websocket error]');
+      onRunStatusChangeRef.current(sessionId, 'idle');
+    });
+
+    const inputDisposable = terminal.onData((data) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'input', data }));
+      }
+    });
+    const resizeObserver = new ResizeObserver(() => {
+      fitAddon.fit();
+      sendResize();
+    });
+    resizeObserver.observe(terminalRef.current);
+
+    return () => {
+      inputDisposable.dispose();
+      resizeObserver.disconnect();
+      socket.close();
+      terminal.dispose();
+      onRunStatusChangeRef.current(sessionId, 'idle');
+    };
+  }, [sessionId, title, providerLabel]);
+
+  return (
+    <div className="flex-1 min-h-0 flex flex-col gap-6 p-6">
+      <div className="shrink-0 flex justify-between items-center gap-4">
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold font-display text-on-surface">{providerLabel}</h1>
+          <span className="px-2 py-1 bg-secondary/10 text-secondary text-[10px] font-bold border border-secondary/20 rounded">REAL TUI</span>
+        </div>
+        <span className="truncate text-slate-500 text-xs font-medium uppercase tracking-tight font-display">{title}</span>
+      </div>
+      <div className="flex-1 min-h-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-950 shadow-2xl">
+        <div ref={terminalRef} className="h-full w-full p-2" />
+      </div>
+    </div>
   );
 };
 
@@ -1034,6 +1151,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const [codexModel, setCodexModel] = useState(fallbackCodexOptions.defaults.model);
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffort>(fallbackCodexOptions.defaults.reasoningEffort);
   const providerLabel = providerMeta[provider].label;
+  const isCodexCli = provider === 'codex-cli';
   const [history, setHistory] = useState([
     { type: 'cmd', text: `${provider}-agent ready`, prompt: true },
     { type: 'info', text: `Initializing ${providerLabel} agent...`, color: 'text-slate-500' },
@@ -1043,7 +1161,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
-    if (provider !== 'codex') return;
+    if (provider !== 'codex' && provider !== 'codex-cli') return;
 
     let cancelled = false;
 
@@ -1128,7 +1246,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   };
 
   const handlePaste = (event: React.ClipboardEvent) => {
-    if (provider !== 'codex') return;
+    if (provider !== 'codex' && provider !== 'codex-cli') return;
 
     const images = Array.from(event.clipboardData.files as FileList).filter((file: File) => file.type.startsWith('image/'));
     if (images.length === 0) return;
@@ -1172,7 +1290,8 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     onRunCommand(prompt);
 
     try {
-      const body = provider === 'codex' && filesToSend.length > 0
+      const isCodexProvider = provider === 'codex' || provider === 'codex-cli';
+      const body = isCodexProvider && filesToSend.length > 0
         ? (() => {
             const formData = new FormData();
             formData.append('prompt', prompt);
@@ -1255,6 +1374,17 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     }
   };
 
+  if (isCodexCli) {
+    return (
+      <CodexCliTerminal
+        sessionId={sessionId}
+        title={title}
+        providerLabel={providerLabel}
+        onRunStatusChange={onRunStatusChange}
+      />
+    );
+  }
+
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-6 p-6">
       <div className="shrink-0 flex justify-between items-center gap-4">
@@ -1329,10 +1459,27 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
                 <span className="whitespace-pre-wrap">{line.text}</span>
               </div>
             ))}
+            {isCodexCli && (
+              <form onSubmit={handleCommand} className="flex items-center gap-2 pt-1">
+                <span className="text-blue-400 font-bold shrink-0">➜</span>
+                <span className="text-slate-500 font-bold select-none whitespace-nowrap">{title}</span>
+                <input
+                  autoFocus
+                  disabled={isRunning}
+                  className="min-w-0 flex-1 bg-transparent border-none outline-none text-blue-300 placeholder:text-blue-900/40"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  spellCheck={false}
+                  autoComplete="off"
+                  placeholder={isRunning ? `${providerLabel} is running...` : 'type a Codex CLI prompt...'}
+                />
+                <div className={`h-5 w-2 ${isRunning ? 'bg-secondary' : 'bg-blue-500'} animate-pulse`}></div>
+              </form>
+            )}
           </div>
         </div>
 
-        <div className="shrink-0 border-t border-slate-800 bg-slate-950">
+        <div className={`shrink-0 border-t border-slate-800 bg-slate-950 ${isCodexCli && attachments.length === 0 ? 'hidden' : ''}`}>
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-2 border-b border-slate-800 px-4 py-3">
               {attachments.map((attachment) => (
@@ -1359,21 +1506,23 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
             </div>
           )}
 
-          <form onSubmit={handleCommand} className="flex items-center gap-2 px-4 py-3 font-mono text-sm">
-            <span className="text-blue-400 font-bold">➜</span>
-            <span className="text-slate-500 font-bold select-none whitespace-nowrap">nexus-gateway</span>
-            <input 
-              autoFocus
-              disabled={isRunning}
-              className="min-w-0 flex-1 bg-transparent border-none outline-none text-blue-300 placeholder:text-blue-900/40"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              spellCheck={false}
-              autoComplete="off"
-              placeholder={isRunning ? `${providerLabel} is running...` : provider === 'codex' ? 'Ask the coding agent or paste images...' : 'Ask the coding agent...'}
-            />
-            <div className={`w-2 h-5 ${isRunning ? 'bg-secondary' : 'bg-blue-500'} animate-pulse`}></div>
-          </form>
+          {!isCodexCli && (
+            <form onSubmit={handleCommand} className="flex items-center gap-2 px-4 py-3 font-mono text-sm">
+              <span className="text-blue-400 font-bold">➜</span>
+              <span className="text-slate-500 font-bold select-none whitespace-nowrap">nexus-gateway</span>
+              <input
+                autoFocus
+                disabled={isRunning}
+                className="min-w-0 flex-1 bg-transparent border-none outline-none text-blue-300 placeholder:text-blue-900/40"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder={isRunning ? `${providerLabel} is running...` : provider === 'codex' ? 'Ask the coding agent or paste images...' : 'Ask the coding agent...'}
+              />
+              <div className={`w-2 h-5 ${isRunning ? 'bg-secondary' : 'bg-blue-500'} animate-pulse`}></div>
+            </form>
+          )}
         </div>
       </div>
 
@@ -1420,6 +1569,8 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
   const [activeChangeRowId, setActiveChangeRowId] = useState<string | null>(null);
   const [changeNotes, setChangeNotes] = useState<Record<string, string>>({});
   const [reviewedChanges, setReviewedChanges] = useState<Record<string, boolean>>({});
+  const [explainingChanges, setExplainingChanges] = useState<Record<string, boolean>>({});
+  const [changeErrors, setChangeErrors] = useState<Record<string, string>>({});
   const annotatedScrollRef = useRef<HTMLDivElement | null>(null);
   const ignoreNextAnnotatedScrollRef = useRef(false);
 
@@ -1443,6 +1594,14 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
             diffSnippet: file.afterContent || file.content || ''
           }))
         });
+        setChangeNotes(Object.fromEntries((data.reviewNotes || []).map((note) => [
+          `${turn.id}:${note.filePath}:${note.groupId}`,
+          note.note
+        ])));
+        setReviewedChanges(Object.fromEntries((data.reviewNotes || []).map((note) => [
+          `${turn.id}:${note.filePath}:${note.groupId}`,
+          note.reviewed
+        ])));
       })
       .catch(() => undefined);
 
@@ -1483,6 +1642,91 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
       return;
     }
     setActiveChangeRowId(null);
+  };
+
+  const persistChangeNote = async (groupId: string, note: string, reviewed: boolean) => {
+    if (!selectedFile) return;
+
+    const response = await fetch(`${API_BASE_URL}/turns/${turn.id}/change-notes`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filePath: selectedFile.name,
+        groupId,
+        note,
+        reviewed
+      })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null) as { error?: string } | null;
+      throw new Error(errorData?.error || `保存失败 (${response.status})`);
+    }
+  };
+
+  const explainChangeGroup = async (groupId: string) => {
+    if (!selectedFile) return;
+    const group = changeGroups.groups.find((item) => item.id === groupId);
+    if (!group) return;
+
+    const stateKey = changeStateKey(groupId);
+    const beforeText = group.rows
+      .map((row) => row.kind === 'update' ? row.beforeText || '' : row.kind === 'delete' ? row.text : '')
+      .filter(Boolean)
+      .join('\n');
+    const afterText = group.rows
+      .map((row) => row.kind === 'delete' ? '' : row.text)
+      .filter(Boolean)
+      .join('\n');
+
+    setExplainingChanges((current) => ({ ...current, [stateKey]: true }));
+    setChangeErrors((current) => {
+      const next = { ...current };
+      delete next[stateKey];
+      return next;
+    });
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/turns/${turn.id}/changes/explain`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filePath: selectedFile.name,
+          groupId,
+          changeKind: group.kind,
+          beforeText,
+          afterText
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null) as { error?: string } | null;
+        throw new Error(errorData?.error || `解释失败 (${response.status})`);
+      }
+
+      const data = await response.json() as { explanation: string };
+      setChangeNotes((current) => ({ ...current, [stateKey]: data.explanation }));
+      await persistChangeNote(groupId, data.explanation, reviewedChanges[stateKey] ?? false);
+    } catch (error) {
+      setChangeErrors((current) => ({
+        ...current,
+        [stateKey]: error instanceof TypeError ? '连接后端失败' : error instanceof Error ? error.message : '解释失败'
+      }));
+    } finally {
+      setExplainingChanges((current) => ({ ...current, [stateKey]: false }));
+    }
+  };
+
+  const toggleReviewedChange = (groupId: string) => {
+    const stateKey = changeStateKey(groupId);
+    const nextReviewed = !reviewedChanges[stateKey];
+    setReviewedChanges((current) => ({
+      ...current,
+      [stateKey]: nextReviewed
+    }));
+    persistChangeNote(groupId, changeNotes[stateKey] ?? '', nextReviewed).catch(() => {
+      setChangeErrors((current) => ({ ...current, [stateKey]: '保存审核状态失败' }));
+    });
   };
 
   return (
@@ -1616,7 +1860,7 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                                   </span>
                                 ) : null}
                                 {groupId ? (
-                                  <span className={`ml-3 flex w-56 shrink-0 items-center gap-2 transition-opacity ${
+                                  <span className={`ml-3 flex w-[30rem] shrink-0 items-center gap-2 transition-opacity ${
                                     isGroupFirstRow ? 'opacity-80 group-hover:opacity-100' : 'pointer-events-none invisible'
                                   }`}>
                                     <input
@@ -1625,15 +1869,23 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                                         ...current,
                                         [stateKey]: event.target.value
                                       }))}
+                                      onBlur={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
+                                        setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
+                                      })}
                                       placeholder="备注"
                                       className="min-w-0 flex-1 rounded border border-slate-800 bg-slate-950/80 px-2 py-1 text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-blue-500"
                                     />
                                     <button
                                       type="button"
-                                      onClick={() => setReviewedChanges((current) => ({
-                                        ...current,
-                                        [stateKey]: !current[stateKey]
-                                      }))}
+                                      onClick={() => explainChangeGroup(groupId)}
+                                      disabled={explainingChanges[stateKey]}
+                                      className="shrink-0 rounded border border-blue-500/40 bg-blue-500/10 px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-blue-200 transition-colors hover:border-blue-400 hover:bg-blue-500/20 disabled:cursor-wait disabled:border-slate-700 disabled:bg-slate-900 disabled:text-slate-500"
+                                    >
+                                      {explainingChanges[stateKey] ? '解释中' : '解释'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleReviewedChange(groupId)}
                                       className={`shrink-0 rounded border px-2 py-1 text-[10px] font-bold uppercase tracking-widest transition-colors ${
                                         reviewedChanges[stateKey]
                                           ? 'border-green-400/50 bg-green-500/15 text-green-200'
@@ -1642,6 +1894,11 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                                     >
                                       {reviewedChanges[stateKey] ? '已审' : '审核'}
                                     </button>
+                                    {changeErrors[stateKey] ? (
+                                      <span className="max-w-20 truncate text-[10px] text-red-300" title={changeErrors[stateKey]}>
+                                        {changeErrors[stateKey]}
+                                      </span>
+                                    ) : null}
                                   </span>
                                 ) : null}
                               </div>

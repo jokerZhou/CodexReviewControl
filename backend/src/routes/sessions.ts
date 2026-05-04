@@ -6,7 +6,7 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
-import { runAgentTurn, type AgentAttachment, type CodexRunOptions } from '../agents/providers.js';
+import { runAgentExplanation, runAgentTurn, type AgentAttachment, type CodexRunOptions } from '../agents/providers.js';
 import { prisma } from '../db/prisma.js';
 import { resolveCodexRunOptions } from '../services/codex-options.js';
 import { extractTaskTitle } from '../services/task-title.js';
@@ -23,6 +23,23 @@ const sendMessageSchema = z.object({
   prompt: z.string().trim().min(1),
   model: z.string().optional(),
   reasoningEffort: z.string().optional()
+});
+
+const changeKindSchema = z.enum(['add', 'delete', 'update']);
+
+const explainChangeSchema = z.object({
+  filePath: z.string().min(1),
+  groupId: z.string().min(1),
+  changeKind: changeKindSchema,
+  beforeText: z.string().optional().default(''),
+  afterText: z.string().optional().default('')
+});
+
+const saveChangeNoteSchema = z.object({
+  filePath: z.string().min(1),
+  groupId: z.string().min(1),
+  note: z.string().default(''),
+  reviewed: z.boolean().default(false)
 });
 
 const allowedImageMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
@@ -47,7 +64,7 @@ const ignoredSnapshotDirs = new Set([
   'vendor'
 ]);
 
-const providerFromDb = (provider: AgentProvider) => provider.toLowerCase();
+const providerFromDb = (provider: AgentProvider) => provider === AgentProvider.CODEX_CLI ? 'codex-cli' : provider.toLowerCase();
 
 const execFile = (command: string, args: string[], options: Record<string, unknown>) => new Promise<{ stdout: string }>((resolve, reject) => {
   execFileCallback(command, args, options as any, (error, stdout) => {
@@ -138,6 +155,28 @@ const snapshotWorkspace = async (workspacePath: string) => {
   return snapshot;
 };
 
+const diffWorkspaceSnapshots = async (workspacePath: string, beforeSnapshot: Map<string, string>) => {
+  const afterSnapshot = await snapshotWorkspace(workspacePath);
+  const paths = new Set([...beforeSnapshot.keys(), ...afterSnapshot.keys()]);
+  const changes: Array<{ path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }> = [];
+
+  for (const path of [...paths].sort()) {
+    const beforeContent = beforeSnapshot.get(path);
+    const afterContent = afterSnapshot.get(path);
+    if (beforeContent === afterContent) continue;
+
+    changes.push({
+      path,
+      kind: beforeContent === undefined ? 'add' : afterContent === undefined ? 'delete' : 'update',
+      beforeContent: beforeContent ?? null,
+      afterContent: afterContent ?? null,
+      content: afterContent ?? null
+    });
+  }
+
+  return changes;
+};
+
 const writeSse = (raw: NodeJS.WritableStream, event: string, data: unknown) => {
   raw.write(`event: ${event}\n`);
   raw.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -224,6 +263,39 @@ const parseTurnPayload = async (request: FastifyRequest, sessionId: string) => {
   };
 };
 
+const cleanExplanationText = (text: string) => {
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !line.startsWith('['))
+    .filter(line => !line.startsWith('thread '))
+    .filter(line => !line.startsWith('turn '));
+
+  return (lines.join('\n') || text).replace(/^["'“”]+|["'“”]+$/g, '').trim();
+};
+
+const buildChangeExplanationPrompt = (turn: { prompt: string; taskTitle: string | null }, body: z.infer<typeof explainChangeSchema>) => {
+  return [
+    '你是代码审核助手。请解释下面这个代码修改块为什么需要修改、修改目的是什么。',
+    '严格要求：',
+    '- 只解释这个修改块，不要修改任何文件，不要执行命令。',
+    '- 输出中文，控制在 2 到 4 句话。',
+    '- 直接输出备注内容，不要 Markdown，不要标题，不要代码块。',
+    '',
+    `任务标题：${turn.taskTitle || '未命名任务'}`,
+    `用户原始需求：${turn.prompt}`,
+    `文件：${body.filePath}`,
+    `修改类型：${body.changeKind}`,
+    '',
+    '修改前：',
+    body.beforeText || '(无)',
+    '',
+    '修改后：',
+    body.afterText || '(无)'
+  ].join('\n');
+};
+
 export async function registerSessionRoutes(app: FastifyInstance) {
   app.get('/turns/:turnId', async (request, reply) => {
     const params = turnParamsSchema.safeParse(request.params);
@@ -238,6 +310,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       },
       include: {
         modifiedFiles: { orderBy: { createdAt: 'asc' } },
+        reviewNotes: { orderBy: { updatedAt: 'asc' } },
         session: { include: { workspace: true } }
       }
     });
@@ -266,8 +339,142 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     return {
       ...turn,
       modifiedFiles: hydratedFiles,
+      reviewNotes: turn.reviewNotes,
       session: undefined
     };
+  });
+
+  app.post('/turns/:turnId/changes/explain', async (request, reply) => {
+    const params = turnParamsSchema.safeParse(request.params);
+    const body = explainChangeSchema.safeParse(request.body);
+
+    if (!params.success || !body.success) {
+      return reply.code(400).send({
+        error: 'Invalid change explanation payload',
+        issues: [...(params.success ? [] : params.error.issues), ...(body.success ? [] : body.error.issues)]
+      });
+    }
+
+    const turn = await prisma.turn.findFirst({
+      where: {
+        id: params.data.turnId,
+        session: { workspace: { deletedAt: null } }
+      },
+      include: {
+        session: { include: { workspace: true } }
+      }
+    });
+
+    if (!turn) {
+      return reply.code(404).send({ error: 'Turn not found' });
+    }
+
+    if (turn.session.provider !== AgentProvider.CODEX && turn.session.provider !== AgentProvider.CODEX_CLI) {
+      return reply.code(400).send({ error: 'Change explanation is only available for Codex sessions.' });
+    }
+
+    if (!turn.session.workspace.path || !resolveWorkspaceFilePath(turn.session.workspace.path, body.data.filePath)) {
+      return reply.code(400).send({ error: 'Invalid file path' });
+    }
+
+    try {
+      const options = await resolveCodexRunOptions(undefined, undefined);
+      const prompt = buildChangeExplanationPrompt(turn, body.data);
+      const explanation = await runAgentExplanation(
+        turn.session.provider,
+        turn.session.id,
+        turn.session.externalSessionId,
+        turn.session.workspace.path,
+        prompt,
+        options
+      );
+
+      if (explanation.externalSessionId && explanation.externalSessionId !== turn.session.externalSessionId) {
+        await prisma.session.update({
+          where: { id: turn.session.id },
+          data: { externalSessionId: explanation.externalSessionId }
+        });
+      }
+
+      const note = cleanExplanationText(explanation.text);
+
+      await prisma.reviewChangeNote.upsert({
+        where: {
+          turnId_filePath_groupId: {
+            turnId: turn.id,
+            filePath: body.data.filePath,
+            groupId: body.data.groupId
+          }
+        },
+        update: { note },
+        create: {
+          turnId: turn.id,
+          filePath: body.data.filePath,
+          groupId: body.data.groupId,
+          note
+        }
+      });
+
+      return { explanation: note };
+    } catch (error) {
+      request.log.error({
+        err: error,
+        turnId: turn.id,
+        sessionId: turn.session.id,
+        provider: providerFromDb(turn.session.provider),
+        filePath: body.data.filePath,
+        groupId: body.data.groupId
+      }, 'Change explanation failed');
+
+      const message = error instanceof Error ? error.message : 'Change explanation failed';
+      return reply.code(502).send({ error: message });
+    }
+  });
+
+  app.patch('/turns/:turnId/change-notes', async (request, reply) => {
+    const params = turnParamsSchema.safeParse(request.params);
+    const body = saveChangeNoteSchema.safeParse(request.body);
+
+    if (!params.success || !body.success) {
+      return reply.code(400).send({
+        error: 'Invalid change note payload',
+        issues: [...(params.success ? [] : params.error.issues), ...(body.success ? [] : body.error.issues)]
+      });
+    }
+
+    const turn = await prisma.turn.findFirst({
+      where: {
+        id: params.data.turnId,
+        session: { workspace: { deletedAt: null } }
+      }
+    });
+
+    if (!turn) {
+      return reply.code(404).send({ error: 'Turn not found' });
+    }
+
+    const note = await prisma.reviewChangeNote.upsert({
+      where: {
+        turnId_filePath_groupId: {
+          turnId: turn.id,
+          filePath: body.data.filePath,
+          groupId: body.data.groupId
+        }
+      },
+      update: {
+        note: body.data.note,
+        reviewed: body.data.reviewed
+      },
+      create: {
+        turnId: turn.id,
+        filePath: body.data.filePath,
+        groupId: body.data.groupId,
+        note: body.data.note,
+        reviewed: body.data.reviewed
+      }
+    });
+
+    return { note };
   });
 
   app.get('/sessions/:sessionId/messages', async (request, reply) => {
@@ -398,7 +605,15 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     const modifiedFiles = new Map<string, { path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }>();
 
     try {
-      for await (const chunk of runAgentTurn(session.provider, session.id, session.workspace.path, body.prompt, body.attachments, body.options)) {
+      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, session.workspace.path, body.prompt, body.attachments, body.options)) {
+        if (chunk.externalSessionId && chunk.externalSessionId !== session.externalSessionId) {
+          await prisma.session.update({
+            where: { id: session.id },
+            data: { externalSessionId: chunk.externalSessionId }
+          });
+          session.externalSessionId = chunk.externalSessionId;
+        }
+
         if (chunk.type === 'file_change' && chunk.changes) {
           for (const change of chunk.changes) {
             const normalizedPath = normalizeWorkspaceFilePath(session.workspace.path, change.path);
@@ -423,6 +638,19 @@ export async function registerSessionRoutes(app: FastifyInstance) {
 
         if (chunk.type === 'done') {
           writeSse(reply.raw, 'status', { status: 'completed', exitCode: chunk.exitCode });
+        }
+      }
+
+      if (session.provider === AgentProvider.CODEX_CLI && modifiedFiles.size === 0) {
+        const snapshotChanges = await diffWorkspaceSnapshots(session.workspace.path, beforeSnapshot);
+        for (const change of snapshotChanges) {
+          modifiedFiles.set(`${change.kind}:${change.path}`, change);
+        }
+        if (snapshotChanges.length > 0) {
+          writeSse(reply.raw, 'file_change', {
+            turnId: turn.id,
+            changes: snapshotChanges.map(({ path, kind }) => ({ path, kind }))
+          });
         }
       }
 

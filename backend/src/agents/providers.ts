@@ -7,6 +7,7 @@ export interface AgentChunk {
   text?: string;
   exitCode?: number | null;
   changes?: Array<{ path: string; kind: 'add' | 'delete' | 'update' }>;
+  externalSessionId?: string;
 }
 
 export interface AgentAttachment {
@@ -17,6 +18,11 @@ export interface AgentAttachment {
 export interface CodexRunOptions {
   model: string;
   modelReasoningEffort: ModelReasoningEffort;
+}
+
+export interface AgentExplanationResult {
+  text: string;
+  externalSessionId?: string;
 }
 
 const codex = new Codex({
@@ -166,11 +172,150 @@ async function* runCursorCliTurn(workspacePath: string, prompt: string): AsyncGe
   }
 }
 
-export async function* runAgentTurn(provider: AgentProvider, sessionId: string, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
+const extractStringField = (value: unknown, keys: string[]): string | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const field = record[key];
+    if (typeof field === 'string' && field.trim()) return field;
+  }
+  for (const field of Object.values(record)) {
+    const nested = extractStringField(field, keys);
+    if (nested) return nested;
+  }
+  return undefined;
+};
+
+const formatCodexCliEvent = (event: unknown) => {
+  if (!event || typeof event !== 'object') return undefined;
+  const record = event as Record<string, unknown>;
+  const type = typeof record.type === 'string' ? record.type : undefined;
+  const message = extractStringField(record, ['message', 'text', 'content', 'summary', 'command', 'aggregated_output']);
+  if (!type && !message) return undefined;
+  return message ? `[${type ?? 'event'}] ${message}` : `[${type}]`;
+};
+
+async function* runCodexCliTurn(sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
+  const args = sessionExternalId
+    ? ['exec', 'resume', '--json', '--skip-git-repo-check', '-m', options.model]
+    : ['exec', '--json', '--skip-git-repo-check', '-C', workspacePath, '-m', options.model, '-s', 'workspace-write'];
+
+  for (const attachment of attachments) {
+    args.push('-i', attachment.path);
+  }
+  if (sessionExternalId) {
+    args.push(sessionExternalId);
+  }
+  args.push(prompt);
+
+  const child = spawn('codex', args, {
+    cwd: workspacePath,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false
+  });
+
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+
+  const queue: AgentChunk[] = [];
+  let notify: (() => void) | undefined;
+  let closed = false;
+  let stdoutBuffer = '';
+  let discoveredSessionId: string | undefined;
+
+  const push = (chunk: AgentChunk) => {
+    queue.push(chunk);
+    notify?.();
+    notify = undefined;
+  };
+
+  const handleJsonLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      const event = JSON.parse(trimmed) as unknown;
+      const eventSessionId = extractStringField(event, ['thread_id', 'session_id', 'conversation_id']);
+      if (eventSessionId && eventSessionId !== discoveredSessionId) {
+        discoveredSessionId = eventSessionId;
+        push({ type: 'output', text: `[session] ${eventSessionId}\n`, externalSessionId: eventSessionId });
+      }
+      const text = formatCodexCliEvent(event);
+      if (text) push({ type: 'output', text: `${text}\n` });
+    } catch {
+      push({ type: 'output', text: `${line}\n` });
+    }
+  };
+
+  child.stdout.on('data', (data: string) => {
+    stdoutBuffer += data;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() ?? '';
+    lines.forEach(handleJsonLine);
+  });
+  child.stderr.on('data', (data: string) => push({ type: 'error', text: data }));
+  child.on('error', (error) => {
+    push({ type: 'error', text: `codex CLI failed to start: ${error.message}` });
+    closed = true;
+    push({ type: 'done', exitCode: 1 });
+  });
+  child.on('close', (exitCode) => {
+    if (stdoutBuffer.trim()) {
+      handleJsonLine(stdoutBuffer);
+      stdoutBuffer = '';
+    }
+    closed = true;
+    push({ type: 'done', exitCode });
+  });
+
+  while (!closed || queue.length > 0) {
+    if (queue.length === 0) {
+      await new Promise<void>((resolve) => {
+        notify = resolve;
+      });
+      continue;
+    }
+
+    const chunk = queue.shift();
+    if (chunk) {
+      yield chunk;
+    }
+  }
+}
+
+export async function* runAgentTurn(provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
   if (provider === 'CODEX') {
     yield* runCodexSdkTurn(sessionId, workspacePath, prompt, attachments, options);
     return;
   }
 
+  if (provider === 'CODEX_CLI') {
+    yield* runCodexCliTurn(sessionExternalId, workspacePath, prompt, attachments, options);
+    return;
+  }
+
   yield* runCursorCliTurn(workspacePath, prompt);
 }
+
+export const runAgentExplanation = async (provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, options: CodexRunOptions): Promise<AgentExplanationResult> => {
+  if (provider !== 'CODEX' && provider !== 'CODEX_CLI') {
+    throw new Error('Change explanation is only available for Codex sessions.');
+  }
+
+  let text = '';
+  let externalSessionId: string | undefined;
+
+  for await (const chunk of runAgentTurn(provider, sessionId, sessionExternalId, workspacePath, prompt, [], options)) {
+    if (chunk.externalSessionId) {
+      externalSessionId = chunk.externalSessionId;
+    }
+    if ((chunk.type === 'output' || chunk.type === 'error') && chunk.text) {
+      text += chunk.text;
+    }
+  }
+
+  return {
+    text: text.trim(),
+    externalSessionId
+  };
+};
