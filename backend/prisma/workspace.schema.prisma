@@ -1,10 +1,11 @@
 generator client {
   provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/workspace-client"
 }
 
 datasource db {
   provider = "sqlite"
-  url      = env("DATABASE_URL")
+  url      = env("WORKSPACE_DATABASE_URL")
 }
 
 enum AgentProvider {
@@ -13,33 +14,18 @@ enum AgentProvider {
   CURSOR
 }
 
-model Workspace {
-  id        String   @id @default(cuid())
-  name      String
-  path      String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  deletedAt DateTime?
-
-  sessions Session[]
-
-  @@index([createdAt])
-  @@index([deletedAt])
-}
-
 model Session {
-  id          String        @id @default(cuid())
-  name        String
-  provider    AgentProvider
+  id                String        @id @default(cuid())
+  name              String
+  provider          AgentProvider
   externalSessionId String?
-  workspaceId String
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-  deletedAt   DateTime?
+  workspaceId       String
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deletedAt         DateTime?
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  messages  Message[]
-  turns     Turn[]
+  messages Message[]
+  turns    Turn[]
 
   @@index([workspaceId])
   @@index([provider])
@@ -62,16 +48,16 @@ model Message {
 }
 
 model Turn {
-  id               String   @id @default(cuid())
+  id               String    @id @default(cuid())
   prompt           String
   taskTitle        String?
   assistantContent String?
   sessionId        String
   userMessageId    String?
-  createdAt        DateTime @default(now())
+  createdAt        DateTime  @default(now())
   completedAt      DateTime?
 
-  session       Session        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  session       Session            @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   modifiedFiles ModifiedFile[]
   reviewNotes   ReviewChangeNote[]
 
@@ -80,14 +66,14 @@ model Turn {
 }
 
 model ModifiedFile {
-  id        String   @id @default(cuid())
-  path      String
-  kind      String
+  id            String   @id @default(cuid())
+  path          String
+  kind          String
   beforeContent String?
   afterContent  String?
-  content   String?
-  turnId    String
-  createdAt DateTime @default(now())
+  content       String?
+  turnId        String
+  createdAt     DateTime @default(now())
 
   turn Turn @relation(fields: [turnId], references: [id], onDelete: Cascade)
 

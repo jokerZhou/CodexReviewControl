@@ -34,5 +34,8 @@
   "defaults": {
     "model": "gpt-5.5",
     "reasoningEffort": "medium"
+  },
+  "timeouts": {
+    "imageTurnSeconds": 0
   }
 }

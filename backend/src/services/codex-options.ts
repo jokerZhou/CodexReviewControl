@@ -14,6 +14,9 @@ export interface CodexOptionsConfig {
     model: string;
     reasoningEffort: ModelReasoningEffort;
   };
+  timeouts: {
+    imageTurnSeconds: number;
+  };
 }
 
 const defaultConfig: CodexOptionsConfig = {
@@ -31,6 +34,9 @@ const defaultConfig: CodexOptionsConfig = {
   defaults: {
     model: 'gpt-5.5',
     reasoningEffort: 'medium'
+  },
+  timeouts: {
+    imageTurnSeconds: 0
   }
 };
 
@@ -48,6 +54,7 @@ const normalizeConfig = (raw: Partial<CodexOptionsConfig>) => {
   const defaultReasoningEffort = raw.defaults?.reasoningEffort && reasoningEfforts.some(option => option.id === raw.defaults?.reasoningEffort)
     ? raw.defaults.reasoningEffort
     : 'medium';
+  const imageTurnSeconds = Number(raw.timeouts?.imageTurnSeconds ?? defaultConfig.timeouts.imageTurnSeconds);
 
   return {
     models,
@@ -55,6 +62,11 @@ const normalizeConfig = (raw: Partial<CodexOptionsConfig>) => {
     defaults: {
       model: defaultModel,
       reasoningEffort: defaultReasoningEffort
+    },
+    timeouts: {
+      imageTurnSeconds: Number.isFinite(imageTurnSeconds) && imageTurnSeconds >= 0
+        ? imageTurnSeconds
+        : defaultConfig.timeouts.imageTurnSeconds
     }
   } satisfies CodexOptionsConfig;
 };
@@ -84,6 +96,9 @@ export const resolveCodexRunOptions = async (model?: string, reasoningEffort?: s
 
   return {
     model: resolvedModel,
-    modelReasoningEffort: resolvedReasoningEffort
+    modelReasoningEffort: resolvedReasoningEffort,
+    imageTurnTimeoutMs: config.timeouts.imageTurnSeconds > 0
+      ? config.timeouts.imageTurnSeconds * 1000
+      : 0
   };
 };

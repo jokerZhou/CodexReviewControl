@@ -18,6 +18,7 @@ export interface AgentAttachment {
 export interface CodexRunOptions {
   model: string;
   modelReasoningEffort: ModelReasoningEffort;
+  imageTurnTimeoutMs: number;
 }
 
 export interface AgentExplanationResult {
@@ -29,7 +30,6 @@ const codex = new Codex({
   env: process.env as Record<string, string>
 });
 const codexThreads = new Map<string, ReturnType<Codex['startThread']>>();
-const imageTurnTimeoutMs = 90_000;
 
 const formatCodexEvent = (event: ThreadEvent) => {
   switch (event.type) {
@@ -85,12 +85,12 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
     ? [{ type: 'text' as const, text: prompt }, ...attachments]
     : prompt;
   const abortController = new AbortController();
-  const timeout = attachments.length > 0
-    ? setTimeout(() => abortController.abort(new Error(`Timed out waiting for Codex image analysis after ${Math.floor(imageTurnTimeoutMs / 1000)} seconds.`)), imageTurnTimeoutMs)
+  const timeout = attachments.length > 0 && options.imageTurnTimeoutMs > 0
+    ? setTimeout(() => abortController.abort(new Error(`Timed out waiting for Codex image analysis after ${Math.floor(options.imageTurnTimeoutMs / 1000)} seconds.`)), options.imageTurnTimeoutMs)
     : undefined;
-  const { events } = await thread.runStreamed(input, { signal: abortController.signal });
 
   try {
+    const { events } = await thread.runStreamed(input, { signal: abortController.signal });
     for await (const event of events) {
       const text = formatCodexEvent(event);
       if (!text) continue;
@@ -111,7 +111,7 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
     if (isAbort && attachments.length > 0) {
       yield {
         type: 'error',
-        text: `Codex image analysis timed out after ${Math.floor(imageTurnTimeoutMs / 1000)} seconds. The image upload succeeded, but the agent did not return a result in time.`
+        text: `Codex image analysis timed out after ${Math.floor(options.imageTurnTimeoutMs / 1000)} seconds. The image upload succeeded, but the agent did not return a result in time.`
       };
       yield { type: 'done', exitCode: 1 };
       return;

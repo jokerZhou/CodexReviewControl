@@ -8,7 +8,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "lint": "tsc --noEmit",
-    "db:generate": "prisma generate",
+    "db:generate": "prisma generate && prisma generate --schema prisma/workspace.schema.prisma",
+    "db:generate:global": "prisma generate",
+    "db:generate:workspace": "prisma generate --schema prisma/workspace.schema.prisma",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:studio": "prisma studio"

@@ -31,7 +31,8 @@ import {
   Download,
   Eye,
   GitBranch,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -680,10 +681,15 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
   );
 };
 
-const CodexCliTerminal = ({ sessionId, title, providerLabel, onRunStatusChange }: { sessionId: string, title: string, providerLabel: string, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
+const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, onRunStatusChange }: { sessionId: string, title: string, providerLabel: string, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const onMessagesLoadedRef = useRef(onMessagesLoaded);
   const onRunStatusChangeRef = useRef(onRunStatusChange);
+
+  useEffect(() => {
+    onMessagesLoadedRef.current = onMessagesLoaded;
+  }, [onMessagesLoaded]);
 
   useEffect(() => {
     onRunStatusChangeRef.current = onRunStatusChange;
@@ -733,6 +739,12 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onRunStatusChange }
       if (message.type === 'exit') {
         terminal.writeln(`\r\n[process exited: ${message.exitCode ?? 0}]`);
         onRunStatusChangeRef.current(sessionId, 'idle');
+      }
+      if (message.type === 'turn_completed') {
+        fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
+          .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to reload turn details')))
+          .then((payload: { messages: ApiMessage[], turns: ApiTurn[] }) => onMessagesLoadedRef.current(sessionId, payload.messages, payload.turns || []))
+          .catch(() => undefined);
       }
     });
     socket.addEventListener('close', () => {
@@ -845,175 +857,10 @@ const ConfirmDeleteWorkspaceModal = ({ project, error, isDeleting, onClose, onCo
 };
 
 const ComparisonModal = ({ turns, onClose }: { turns: Turn[], onClose: () => void }) => {
-  const [selectedFileIndex, setSelectedFileIndex] = useState<Record<string, number>>({});
-
-  return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/90 p-4 lg:p-12 backdrop-blur-md"
-    >
-      <motion.div 
-        initial={{ y: 20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        className="bg-surface-container border border-slate-800 rounded-2xl w-full max-w-6xl h-full flex flex-col shadow-2xl overflow-hidden"
-      >
-        {/* Modal Header */}
-        <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-blue-500/10 rounded-xl">
-              <GitBranch className="text-blue-500" size={24} />
-            </div>
-            <div>
-              <h2 className="text-2xl font-display font-bold text-white tracking-tight">Technical Audit Report</h2>
-              <p className="text-slate-500 text-sm">Comparing {turns.length} sequence points across the session architecture</p>
-            </div>
-          </div>
-          <button 
-            onClick={onClose} 
-            className="p-2 hover:bg-slate-800 rounded-full transition-all text-slate-500 hover:text-white"
-          >
-            <Plus className="rotate-45" size={24} />
-          </button>
-        </div>
-        
-        {/* Modal Body */}
-        <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-12 hide-scrollbar">
-          {turns.map((turn, turnIdx) => (
-            <div key={turn.id} className="relative group">
-              {/* Turn Connector Line */}
-              {turnIdx < turns.length - 1 && (
-                <div className="absolute left-[19px] top-10 bottom-[-48px] w-px bg-slate-800 group-hover:bg-blue-500/30 transition-colors"></div>
-              )}
-
-              <div className="flex gap-6">
-                {/* Turn Marker */}
-                <div className="relative z-10">
-                  <div className="w-10 h-10 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center text-blue-400 font-bold font-mono text-sm shadow-xl">
-                    {turnIdx + 1}
-                  </div>
-                </div>
-
-                <div className="flex-1 space-y-6">
-                  {/* Turn Header Info */}
-                  <div className="flex flex-col lg:flex-row lg:items-center gap-4 justify-between">
-                    <div>
-                      <div className="text-[10px] text-slate-500 uppercase font-black tracking-[0.2em] mb-1">{turn.timestamp} • CONTEXT_TURN_{turn.id.split('-')[1]}</div>
-                      <h3 className="text-lg font-medium text-white italic">"{turn.userMessage}"</h3>
-                    </div>
-                    <div className="px-4 py-2 bg-slate-900 border border-slate-800 rounded-lg shrink-0">
-                      <div className="text-[10px] text-slate-600 uppercase font-bold mb-1">Status</div>
-                      <div className="text-secondary text-xs font-bold flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-secondary animate-pulse"></div>
-                        Architecture Verified
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Summary Block */}
-                  <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-5 leading-relaxed text-sm text-slate-300">
-                    <p>{turn.summary}</p>
-                  </div>
-
-                  {/* File Specific Analysis */}
-                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                    {/* File List/Tabs */}
-                    <div className="lg:col-span-4 space-y-2">
-                      <div className="text-[10px] text-slate-600 uppercase font-bold px-1 mb-2">Affected Assets</div>
-                      {turn.modifiedFiles.map((file, fIdx) => (
-                        <button
-                          key={fIdx}
-                          onClick={() => setSelectedFileIndex(prev => ({ ...prev, [turn.id]: fIdx }))}
-                          className={`w-full text-left p-3 rounded-lg border transition-all flex items-center gap-3 ${
-                            (selectedFileIndex[turn.id] || 0) === fIdx 
-                            ? 'bg-blue-500/10 border-blue-500/50 ring-1 ring-blue-500/20' 
-                            : 'bg-slate-950 border-slate-800 hover:border-slate-700'
-                          }`}
-                        >
-                          <span className={`text-xs font-mono font-bold shrink-0 ${file.statusColor}`}>{file.status}</span>
-                          <span className={`text-xs font-mono truncate flex-1 ${ (selectedFileIndex[turn.id] || 0) === fIdx ? 'text-blue-400' : 'text-slate-400'}`}>
-                            {file.name}
-                          </span>
-                          <ChevronDown size={14} className={`text-slate-600 transition-transform ${ (selectedFileIndex[turn.id] || 0) === fIdx ? '-rotate-90 text-blue-500' : ''}`} />
-                        </button>
-                      ))}
-                    </div>
-
-                    {/* File Detailed Reasoning & Diff */}
-                    <div className="lg:col-span-8 bg-slate-950/50 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[400px]">
-                      {(() => {
-                        const file = turn.modifiedFiles[selectedFileIndex[turn.id] || 0];
-                        if (!file) return null;
-                        return (
-                          <>
-                            <div className="p-4 border-b border-slate-800 bg-slate-900/30 flex justify-between items-center">
-                              <div className="flex items-center gap-3">
-                                <span className={`text-xs font-mono font-bold ${file.statusColor}`}>{file.status === 'M' ? 'Modified' : file.status === 'A' ? 'Added' : 'Deleted'}</span>
-                                <span className="text-xs font-mono text-slate-300">{file.name}</span>
-                              </div>
-                              <button className="text-[10px] text-blue-500 hover:text-blue-400 font-bold uppercase tracking-widest">Open in Editor</button>
-                            </div>
-                            
-                            <div className="flex-1 overflow-y-auto p-5 space-y-6 hide-scrollbar">
-                              <div>
-                                <div className="text-[10px] text-blue-400 uppercase font-black tracking-widest mb-2">Technical Rationale</div>
-                                <p className="text-sm text-on-surface-variant leading-relaxed">
-                                  {file.reason || "Automatic optimization based on turn context requirements."}
-                                </p>
-                              </div>
-
-                              <div className="p-4 bg-slate-900 border border-slate-800 rounded-lg">
-                                <div className="text-[10px] text-tertiary uppercase font-black tracking-widest mb-2">Peer Review Notes</div>
-                                <p className="text-xs text-slate-500 leading-relaxed italic">
-                                  "{file.remarks || "No supplementary notes for this asset modification."}"
-                                </p>
-                              </div>
-
-                              {file.diffSnippet && (
-                                <div>
-                                  <div className="text-[10px] text-slate-600 uppercase font-extrabold tracking-widest mb-2">Content Delta (Unified Diff)</div>
-                                  <div className="rounded-lg bg-slate-950 p-4 font-mono text-[11px] leading-relaxed border border-white/5 text-slate-400 overflow-x-auto whitespace-pre">
-                                    {file.diffSnippet}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </>
-                        );
-                      })()}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Modal Footer */}
-        <div className="p-6 border-t border-slate-800 bg-slate-900/80 flex flex-col sm:flex-row gap-4 items-center justify-between">
-           <div className="flex items-center gap-3 text-slate-500 text-xs italic">
-             <ShieldCheck size={14} className="text-secondary" />
-             AI Integrity scan complete. Metadata verified against session UID.
-           </div>
-           <div className="flex gap-3 w-full sm:w-auto">
-             <button className="flex-1 sm:flex-none px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition-colors border border-slate-700">
-               SAVE REPORT
-             </button>
-             <button 
-              onClick={onClose}
-              className="flex-1 sm:flex-none px-10 py-2.5 bg-blue-500 hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition-all shadow-[0_0_20px_rgba(59,130,246,0.3)]"
-            >
-              FINALIZE REVIEW
-            </button>
-           </div>
-        </div>
-      </motion.div>
-    </motion.div>
-  );
+  return <TurnDetailModal turn={turns[0]} turns={turns} onClose={onClose} />;
 };
 
-const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, onNewSession, onOpenAddProject, onDeleteProject }: { activeItem: string | null, setActiveItem: (id: string) => void, projects: WorkspaceProject[], sessionStatuses: Record<string, AgentRunStatus>, onNewSession: (projectId: string) => void, onOpenAddProject: () => void, onDeleteProject: (projectId: string) => void }) => {
+const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, onNewSession, onOpenAddProject, onDeleteProject, onDeleteSession }: { activeItem: string | null, setActiveItem: (id: string) => void, projects: WorkspaceProject[], sessionStatuses: Record<string, AgentRunStatus>, onNewSession: (projectId: string) => void, onOpenAddProject: () => void, onDeleteProject: (projectId: string) => void, onDeleteSession: (sessionId: string) => void }) => {
   const [expandedFolders, setExpandedFolders] = useState<string[]>(['nexus-gateway']);
 
   const toggleFolder = (folder: string) => {
@@ -1096,35 +943,51 @@ const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, o
                       const runStatus = sessionStatuses[item.id] ?? 'idle';
 
                       return (
-                        <button
+                        <div
                           key={item.id}
-                          onClick={() => setActiveItem(item.id)}
-                          className={`w-full flex items-center gap-3 pl-10 pr-4 py-1.5 transition-all text-[11px] font-medium border-l-2 ${
+                          className={`group/session flex items-center gap-2 border-l-2 pl-10 pr-2 transition-all ${
                             activeItem === item.id 
-                            ? 'bg-blue-500/10 text-blue-400 border-blue-500' 
-                            : 'text-slate-500 hover:bg-slate-900/30 hover:text-slate-300 border-transparent'
+                              ? 'bg-blue-500/10 text-blue-400 border-blue-500'
+                              : 'text-slate-500 hover:bg-slate-900/30 hover:text-slate-300 border-transparent'
                           }`}
                         >
-                          {item.icon}
-                          <span className="min-w-0 flex-1 truncate text-left">{item.name}</span>
-                          <span className={`flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[8px] font-black uppercase tracking-widest ${
-                            runStatus === 'busy'
-                              ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
-                              : 'border-secondary/30 bg-secondary/10 text-secondary'
-                          }`}>
-                            <span className={`h-1.5 w-1.5 rounded-full ${runStatus === 'busy' ? 'animate-pulse bg-amber-300' : 'bg-secondary'}`} />
-                            {runStatus === 'busy' ? 'busy' : 'idle'}
-                          </span>
-                          {item.provider && (
-                            <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[8px] font-black uppercase tracking-widest ${
-                              item.provider === 'cursor'
-                                ? 'border-secondary/30 text-secondary'
-                                : 'border-blue-500/30 text-blue-400'
+                          <button
+                            onClick={() => setActiveItem(item.id)}
+                            className="flex min-w-0 flex-1 items-center gap-3 py-1.5 text-left text-[11px] font-medium"
+                          >
+                            {item.icon}
+                            <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                            <span className={`flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[8px] font-black uppercase tracking-widest ${
+                              runStatus === 'busy'
+                                ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+                                : 'border-secondary/30 bg-secondary/10 text-secondary'
                             }`}>
-                              {item.provider}
+                              <span className={`h-1.5 w-1.5 rounded-full ${runStatus === 'busy' ? 'animate-pulse bg-amber-300' : 'bg-secondary'}`} />
+                              {runStatus === 'busy' ? 'busy' : 'idle'}
                             </span>
-                          )}
-                        </button>
+                            {item.provider && (
+                              <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[8px] font-black uppercase tracking-widest ${
+                                item.provider === 'cursor'
+                                  ? 'border-secondary/30 text-secondary'
+                                  : 'border-blue-500/30 text-blue-400'
+                              }`}>
+                                {item.provider}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onDeleteSession(item.id);
+                            }}
+                            title={`Delete ${item.name}`}
+                            aria-label={`Delete ${item.name}`}
+                            className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-slate-700 opacity-0 transition-colors hover:bg-red-500/10 hover:text-red-300 group-hover/session:opacity-100"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
                       );
                     })()
                   ))}
@@ -1328,7 +1191,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         const data = JSON.parse(dataLine.slice(6));
         if (event === 'status') {
           const statusText = data.status === 'analyzing_images'
-            ? `[analyzing_images] ${providerLabel} received ${data.attachmentCount} image${data.attachmentCount === 1 ? '' : 's'} for ${data.model}`
+            ? `[analyzing_images] ${providerLabel} received ${data.attachmentCount} image${data.attachmentCount === 1 ? '' : 's'} for ${data.model}${data.timeoutSeconds ? `, timeout ${data.timeoutSeconds}s` : ', no timeout'}`
             : `[${data.status}] ${providerLabel}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`;
           setHistory(prev => [...prev, { type: 'info', text: statusText, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
         }
@@ -1380,6 +1243,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         sessionId={sessionId}
         title={title}
         providerLabel={providerLabel}
+        onMessagesLoaded={onMessagesLoaded}
         onRunStatusChange={onRunStatusChange}
       />
     );
@@ -1562,8 +1426,15 @@ const StatCard = ({ label, value, color, progress, subtext, indicator }: any) =>
   );
 };
 
-const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void }) => {
-  const [detailTurn, setDetailTurn] = useState(turn);
+const findFirstTurnWithFilesIndex = (items: Turn[]) => {
+  const index = items.findIndex((item) => item.modifiedFiles.length > 0);
+  return index >= 0 ? index : 0;
+};
+
+const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[], onClose: () => void }) => {
+  const initialTurns = turns && turns.length > 0 ? turns : [turn];
+  const [detailTurns, setDetailTurns] = useState<Turn[]>(initialTurns);
+  const [selectedTurnIndex, setSelectedTurnIndex] = useState(() => findFirstTurnWithFilesIndex(initialTurns));
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
   const [reviewMode, setReviewMode] = useState<'compare' | 'annotated'>('annotated');
   const [activeChangeRowId, setActiveChangeRowId] = useState<string | null>(null);
@@ -1571,19 +1442,26 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
   const [reviewedChanges, setReviewedChanges] = useState<Record<string, boolean>>({});
   const [explainingChanges, setExplainingChanges] = useState<Record<string, boolean>>({});
   const [changeErrors, setChangeErrors] = useState<Record<string, string>>({});
+  const [openCommentKey, setOpenCommentKey] = useState<string | null>(null);
+  const [isUnreviewedOpen, setIsUnreviewedOpen] = useState(false);
+  const [pendingReviewJump, setPendingReviewJump] = useState<{ fileIndex: number; groupId: string } | null>(null);
   const annotatedScrollRef = useRef<HTMLDivElement | null>(null);
   const ignoreNextAnnotatedScrollRef = useRef(false);
+  const detailTurn = detailTurns[selectedTurnIndex] || initialTurns[0] || turn;
 
   useEffect(() => {
     let cancelled = false;
 
-    fetch(`${API_BASE_URL}/turns/${turn.id}`)
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to load turn details')))
-      .then((data: ApiTurn) => {
+    Promise.all(initialTurns.map((item) => (
+      fetch(`${API_BASE_URL}/turns/${item.id}`)
+        .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to load turn details')))
+        .then((data: ApiTurn) => ({ item, data }))
+    )))
+      .then((items) => {
         if (cancelled) return;
-        setDetailTurn({
-          ...turn,
-          summary: data.assistantContent || turn.summary,
+        const hydratedTurns: Turn[] = items.map(({ item, data }) => ({
+          ...item,
+          summary: data.assistantContent || item.summary,
           modifiedFiles: data.modifiedFiles.map((file) => ({
             name: file.path,
             status: file.kind === 'add' ? 'A' : file.kind === 'delete' ? 'D' : 'M',
@@ -1593,36 +1471,100 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
             afterContent: file.afterContent || file.content || null,
             diffSnippet: file.afterContent || file.content || ''
           }))
-        });
-        setChangeNotes(Object.fromEntries((data.reviewNotes || []).map((note) => [
-          `${turn.id}:${note.filePath}:${note.groupId}`,
+        }));
+        setDetailTurns(hydratedTurns);
+        setSelectedTurnIndex((current) => (
+          hydratedTurns[current]?.modifiedFiles.length > 0 ? current : findFirstTurnWithFilesIndex(hydratedTurns)
+        ));
+        setSelectedFileIndex(0);
+        setChangeNotes(Object.fromEntries(items.flatMap(({ item, data }) => (data.reviewNotes || []).map((note) => [
+          `${item.id}:${note.filePath}:${note.groupId}`,
           note.note
-        ])));
-        setReviewedChanges(Object.fromEntries((data.reviewNotes || []).map((note) => [
-          `${turn.id}:${note.filePath}:${note.groupId}`,
+        ]))));
+        setReviewedChanges(Object.fromEntries(items.flatMap(({ item, data }) => (data.reviewNotes || []).map((note) => [
+          `${item.id}:${note.filePath}:${note.groupId}`,
           note.reviewed
-        ])));
+        ]))));
       })
       .catch(() => undefined);
 
     return () => {
       cancelled = true;
     };
-  }, [turn]);
+  }, [turn, turns]);
 
   useEffect(() => {
     setReviewMode('annotated');
     setActiveChangeRowId(null);
     annotatedScrollRef.current?.scrollTo({ top: 0 });
-  }, [selectedFileIndex]);
+  }, [selectedFileIndex, selectedTurnIndex]);
+
+  useEffect(() => {
+    setSelectedFileIndex(0);
+    setActiveChangeRowId(null);
+    setOpenCommentKey(null);
+  }, [selectedTurnIndex]);
 
   const selectedFile = detailTurn.modifiedFiles[selectedFileIndex];
+  const hasAnyModifiedFiles = detailTurns.some((item) => item.modifiedFiles.length > 0);
+  useEffect(() => {
+    const fileCount = detailTurn.modifiedFiles.length;
+    if (selectedFileIndex >= fileCount) {
+      setSelectedFileIndex(0);
+    }
+    if (fileCount === 0 && hasAnyModifiedFiles) {
+      setSelectedTurnIndex(findFirstTurnWithFilesIndex(detailTurns));
+    }
+  }, [detailTurn.modifiedFiles.length, detailTurns, hasAnyModifiedFiles, selectedFileIndex]);
+  const reviewableFileSummaries = useMemo(() => detailTurn.modifiedFiles.map((file, fileIndex) => {
+    if (file.status !== 'M' || reviewDiffUnavailableText(file)) {
+      return { file, fileIndex, groups: [] as Array<{ id: string; kind: 'add' | 'delete' | 'update'; rows: AnnotatedRow[] }> };
+    }
+
+    const rows = renderAnnotatedCurrentLines(file.beforeContent, file.afterContent);
+    return {
+      file,
+      fileIndex,
+      groups: groupAdjacentChanges(rows).groups
+    };
+  }), [detailTurn.modifiedFiles]);
+  const reviewStats = useMemo(() => {
+    const groups = reviewableFileSummaries.flatMap(({ file, fileIndex, groups }) => groups.map((group) => {
+      const stateKey = `${detailTurn.id}:${file.name}:${group.id}`;
+      return {
+        file,
+        fileIndex,
+        group,
+        stateKey
+      };
+    }));
+    const selectedFileGroups = groups.filter((item) => item.fileIndex === selectedFileIndex);
+    const reviewed = selectedFileGroups.filter((item) => reviewedChanges[item.stateKey]).length;
+
+    return {
+      fileCount: detailTurn.modifiedFiles.length,
+      blockCount: selectedFileGroups.length,
+      reviewed,
+      unreviewed: selectedFileGroups.length - reviewed,
+      unreviewedItems: selectedFileGroups.filter((item) => !reviewedChanges[item.stateKey])
+    };
+  }, [detailTurn.id, detailTurn.modifiedFiles.length, reviewableFileSummaries, reviewedChanges, selectedFileIndex]);
   const annotatedRows = useMemo(() => {
     if (!selectedFile || selectedFile.status !== 'M' || reviewDiffUnavailableText(selectedFile)) return [];
     return renderAnnotatedCurrentLines(selectedFile.beforeContent, selectedFile.afterContent);
   }, [selectedFile]);
   const changeGroups = useMemo(() => groupAdjacentChanges(annotatedRows), [annotatedRows]);
-  const changeStateKey = (groupId: string) => `${turn.id}:${selectedFile?.name ?? 'unknown'}:${groupId}`;
+  const changeStateKey = (groupId: string) => `${detailTurn.id}:${selectedFile?.name ?? 'unknown'}:${groupId}`;
+  useEffect(() => {
+    if (!pendingReviewJump || pendingReviewJump.fileIndex !== selectedFileIndex) return;
+    jumpToAnnotatedGroup(pendingReviewJump.groupId);
+    setPendingReviewJump(null);
+  }, [pendingReviewJump, selectedFileIndex, changeGroups]);
+  const noteSummary = (note: string | undefined) => {
+    const normalized = (note || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '添加备注';
+    return normalized.length > 34 ? `${normalized.slice(0, 34)}...` : normalized;
+  };
   const jumpToAnnotatedGroup = (groupId: string) => {
     const group = changeGroups.groups.find((item) => item.id === groupId);
     const firstRow = group?.rows[0];
@@ -1639,15 +1581,25 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
   const handleAnnotatedScroll = () => {
     if (ignoreNextAnnotatedScrollRef.current) {
       ignoreNextAnnotatedScrollRef.current = false;
+    }
+  };
+  const jumpToReviewItem = (fileIndex: number, groupId: string) => {
+    setIsUnreviewedOpen(false);
+    setReviewMode('annotated');
+    setOpenCommentKey(null);
+    setPendingReviewJump({ fileIndex, groupId });
+    if (fileIndex === selectedFileIndex) {
+      jumpToAnnotatedGroup(groupId);
+      setPendingReviewJump(null);
       return;
     }
-    setActiveChangeRowId(null);
+    setSelectedFileIndex(fileIndex);
   };
 
   const persistChangeNote = async (groupId: string, note: string, reviewed: boolean) => {
     if (!selectedFile) return;
 
-    const response = await fetch(`${API_BASE_URL}/turns/${turn.id}/change-notes`, {
+    const response = await fetch(`${API_BASE_URL}/turns/${detailTurn.id}/change-notes`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1687,7 +1639,7 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
     });
 
     try {
-      const response = await fetch(`${API_BASE_URL}/turns/${turn.id}/changes/explain`, {
+      const response = await fetch(`${API_BASE_URL}/turns/${detailTurn.id}/changes/explain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1720,10 +1672,17 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
   const toggleReviewedChange = (groupId: string) => {
     const stateKey = changeStateKey(groupId);
     const nextReviewed = !reviewedChanges[stateKey];
+    const nextGroup = nextReviewed
+      ? changeGroups.groups.slice(changeGroups.groups.findIndex((group) => group.id === groupId) + 1).find((group) => !reviewedChanges[changeStateKey(group.id)])
+      : null;
     setReviewedChanges((current) => ({
       ...current,
       [stateKey]: nextReviewed
     }));
+    if (nextGroup) {
+      setOpenCommentKey(null);
+      window.setTimeout(() => jumpToAnnotatedGroup(nextGroup.id), 0);
+    }
     persistChangeNote(groupId, changeNotes[stateKey] ?? '', nextReviewed).catch(() => {
       setChangeErrors((current) => ({ ...current, [stateKey]: '保存审核状态失败' }));
     });
@@ -1741,45 +1700,127 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
         animate={{ y: 0, opacity: 1 }}
         className="flex h-[92vh] w-[94vw] flex-col overflow-hidden rounded-lg border border-slate-800 bg-slate-950 shadow-2xl"
       >
-        <div className="flex items-start justify-between border-b border-slate-800 p-4">
+        <div className="flex items-start justify-between gap-6 border-b border-slate-800 p-4">
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-bold uppercase tracking-widest text-blue-400">{detailTurn.taskTitle || 'Untitled Task'}</h2>
-            <p className="mt-2 text-xs leading-relaxed text-slate-400">"{detailTurn.userMessage}"</p>
+            <h2 className="truncate text-sm font-bold uppercase tracking-widest text-blue-400">
+              {detailTurns.length > 1 ? `批量代码审核 (${detailTurns.length})` : detailTurn.taskTitle || 'Untitled Task'}
+            </h2>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              {detailTurns.length > 1 ? `${detailTurn.taskTitle || 'Untitled Task'}: "${detailTurn.userMessage}"` : `"${detailTurn.userMessage}"`}
+            </p>
           </div>
-          <button onClick={onClose} className="rounded p-1.5 text-slate-500 transition-colors hover:bg-slate-900 hover:text-slate-200" aria-label="Close">
-            <X size={16} />
-          </button>
+          <div className="flex shrink-0 items-start gap-4">
+            <div className="flex items-center gap-2 rounded border border-slate-800 bg-slate-900/40 p-1">
+              <div className="rounded px-3 py-2 text-center">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-slate-600">文件</div>
+                <div className="mt-1 text-sm font-bold text-slate-200">{reviewStats.fileCount}</div>
+              </div>
+              <div className="rounded px-3 py-2 text-center">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-slate-600">当前修改块</div>
+                <div className="mt-1 text-sm font-bold text-blue-300">{reviewStats.blockCount}</div>
+              </div>
+              <div className="rounded px-3 py-2 text-center">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-slate-600">当前已审</div>
+                <div className="mt-1 text-sm font-bold text-secondary">{reviewStats.reviewed}</div>
+              </div>
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setIsUnreviewedOpen((current) => !current)}
+                  className="rounded border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-center transition-colors hover:border-amber-300/60"
+                >
+                  <div className="text-[10px] font-bold uppercase tracking-widest text-amber-300/80">当前未审</div>
+                  <div className="mt-1 text-sm font-bold text-amber-200">{reviewStats.unreviewed}</div>
+                </button>
+                {isUnreviewedOpen && (
+                  <div className="absolute right-0 top-14 z-40 max-h-80 w-96 overflow-y-auto rounded border border-amber-400/30 bg-slate-950 p-2 shadow-[0_18px_60px_rgba(0,0,0,0.55)] hide-scrollbar">
+                    {reviewStats.unreviewedItems.length === 0 ? (
+                      <div className="px-3 py-6 text-center text-[11px] font-bold uppercase tracking-widest text-slate-600">全部已审核</div>
+                    ) : (
+                      <div className="space-y-1">
+                        {reviewStats.unreviewedItems.map((item) => {
+                          const firstRow = item.group.rows[0];
+                          const preview = (firstRow?.text || firstRow?.beforeText || '').replace(/\s+/g, ' ').trim();
+
+                          return (
+                            <button
+                              key={`pending-${item.stateKey}`}
+                              type="button"
+                              onClick={() => jumpToReviewItem(item.fileIndex, item.group.id)}
+                              className="w-full rounded border border-slate-800 bg-slate-900/60 px-3 py-2 text-left transition-colors hover:border-blue-500/60 hover:bg-blue-500/10"
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className={`text-[10px] font-bold uppercase ${
+                                  item.group.kind === 'add' ? 'text-green-300' : item.group.kind === 'delete' ? 'text-red-300' : 'text-yellow-300'
+                                }`}>
+                                  {item.group.kind}
+                                </span>
+                                <span className="truncate text-[11px] font-mono text-slate-300">{item.file.name}</span>
+                              </div>
+                              <div className="mt-1 truncate text-[11px] text-slate-500">{preview || `${item.group.rows.length} changed lines`}</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+            <button onClick={onClose} className="rounded p-1.5 text-slate-500 transition-colors hover:bg-slate-900 hover:text-slate-200" aria-label="Close">
+              <X size={16} />
+            </button>
+          </div>
         </div>
         <div className="flex-1 min-h-0 overflow-hidden">
-          {detailTurn.modifiedFiles.length === 0 ? (
+          {!hasAnyModifiedFiles ? (
             <div className="flex h-48 items-center justify-center text-xs font-bold uppercase tracking-widest text-slate-600">
-              No file changes recorded for this turn
+              No file changes recorded for selected conversations
             </div>
           ) : (
             <div className="grid h-full min-h-0 grid-cols-12">
-              <div className="col-span-4 border-r border-slate-800 overflow-y-auto p-3 hide-scrollbar">
+              <div className="col-span-3 border-r border-slate-800 overflow-y-auto p-3 hide-scrollbar">
                 <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-600">Files</div>
-                <div className="space-y-2">
-                  {detailTurn.modifiedFiles.map((file, index) => (
-                    <button
-                      key={`${file.name}-${index}`}
-                      onClick={() => setSelectedFileIndex(index)}
-                      className={`w-full rounded border px-3 py-2 text-left transition-colors ${
-                        selectedFileIndex === index
-                          ? 'border-blue-500 bg-blue-500/10'
-                          : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className={`text-xs font-mono font-bold ${file.statusColor}`}>{file.status}</span>
-                        <span className="truncate text-[11px] font-mono text-slate-300">{file.name}</span>
-                      </div>
-                    </button>
+                <div className="space-y-3">
+                  {detailTurns.map((item, turnIndex) => (
+                    <div key={`review-turn-${item.id}`} className="space-y-1.5">
+                      {detailTurns.length > 1 && (
+                        <div className="px-1 pb-1">
+                          <div className="truncate text-[10px] font-bold uppercase tracking-widest text-blue-400">{item.taskTitle || 'Untitled Task'}</div>
+                          <div className="mt-0.5 text-[9px] font-bold uppercase tracking-widest text-slate-600">{item.timestamp}</div>
+                        </div>
+                      )}
+                      {item.modifiedFiles.length === 0 ? (
+                        <div className="rounded border border-slate-800 bg-slate-900/30 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-600">
+                          0 changed files
+                        </div>
+                      ) : (
+                        item.modifiedFiles.map((file, index) => (
+                          <button
+                            key={`${item.id}:${file.name}-${index}`}
+                            onClick={() => {
+                              setSelectedTurnIndex(turnIndex);
+                              setSelectedFileIndex(index);
+                            }}
+                            className={`w-full rounded border px-3 py-2 text-left transition-colors ${
+                              selectedTurnIndex === turnIndex && selectedFileIndex === index
+                                ? 'border-blue-500 bg-blue-500/10'
+                                : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className={`text-xs font-mono font-bold ${file.statusColor}`}>{file.status}</span>
+                              <span className="truncate text-[11px] font-mono text-slate-300">{file.name}</span>
+                            </div>
+                          </button>
+                        ))
+                      )}
+                    </div>
                   ))}
                 </div>
               </div>
 
-              <div className="col-span-8 flex min-h-0 flex-col overflow-hidden">
+              <div className="col-span-9 flex min-h-0 flex-col overflow-hidden">
                 <div className="border-b border-slate-800 px-4 py-3">
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex min-w-0 items-center gap-3">
@@ -1851,30 +1892,41 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                                 <span className="mr-3 w-10 shrink-0 font-bold uppercase">
                                   {row.kind === 'add' ? 'ADD' : row.kind === 'delete' ? 'DEL' : row.kind === 'update' ? 'MOD' : ''}
                                 </span>
-                                <span className={`${row.kind === 'delete' ? 'line-through decoration-red-300/70' : ''} flex-1 whitespace-pre-wrap`}>
-                                  {row.text || ' '}
-                                </span>
                                 {row.kind === 'update' && row.beforeText ? (
-                                  <span className="ml-4 hidden max-w-[36%] shrink-0 truncate text-red-200/80 xl:block">
-                                    was: {row.beforeText || ' '}
+                                  <span className="flex min-w-0 flex-1 flex-col gap-1 whitespace-pre-wrap">
+                                    <span className="flex min-w-0 items-start gap-2 rounded border border-red-400/20 bg-red-500/10 px-2 py-1 text-red-100">
+                                      <span className="shrink-0 select-none text-red-300">-</span>
+                                      <span className="min-w-0 flex-1 break-words line-through decoration-red-300/70">{row.beforeText || ' '}</span>
+                                    </span>
+                                    <span className="flex min-w-0 items-start gap-2 rounded border border-green-400/20 bg-green-500/10 px-2 py-1 text-green-100">
+                                      <span className="shrink-0 select-none text-green-300">+</span>
+                                      <span className="min-w-0 flex-1 break-words">{row.text || ' '}</span>
+                                    </span>
                                   </span>
-                                ) : null}
+                                ) : (
+                                  <span className={`${row.kind === 'delete' ? 'line-through decoration-red-300/70' : ''} flex-1 whitespace-pre-wrap`}>
+                                    {row.text || ' '}
+                                  </span>
+                                )}
                                 {groupId ? (
-                                  <span className={`ml-3 flex w-[30rem] shrink-0 items-center gap-2 transition-opacity ${
-                                    isGroupFirstRow ? 'opacity-80 group-hover:opacity-100' : 'pointer-events-none invisible'
+                                  <span className={`relative ml-3 flex w-[24rem] shrink-0 items-center justify-end gap-2 transition-opacity ${
+                                    isGroupFirstRow ? 'opacity-90 group-hover:opacity-100' : 'pointer-events-none invisible'
                                   }`}>
-                                    <input
-                                      value={changeNotes[stateKey] ?? ''}
-                                      onChange={(event) => setChangeNotes((current) => ({
-                                        ...current,
-                                        [stateKey]: event.target.value
-                                      }))}
-                                      onBlur={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
-                                        setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
-                                      })}
-                                      placeholder="备注"
-                                      className="min-w-0 flex-1 rounded border border-slate-800 bg-slate-950/80 px-2 py-1 text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-blue-500"
-                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => setOpenCommentKey(openCommentKey === stateKey ? null : stateKey)}
+                                      className={`flex min-w-0 flex-1 items-center gap-2 rounded border px-2 py-1 text-left text-[11px] transition-colors ${
+                                        reviewedChanges[stateKey]
+                                          ? 'border-green-400/40 bg-green-500/10 text-green-100'
+                                          : changeNotes[stateKey]
+                                            ? 'border-blue-400/40 bg-blue-500/10 text-blue-100'
+                                            : 'border-slate-700 bg-slate-900/80 text-slate-400 hover:border-blue-500 hover:text-blue-200'
+                                      }`}
+                                      title={changeNotes[stateKey] || '添加备注'}
+                                    >
+                                      <MessageSquare size={12} className="shrink-0" />
+                                      <span className="truncate">{noteSummary(changeNotes[stateKey])}</span>
+                                    </button>
                                     <button
                                       type="button"
                                       onClick={() => explainChangeGroup(groupId)}
@@ -1894,11 +1946,57 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
                                     >
                                       {reviewedChanges[stateKey] ? '已审' : '审核'}
                                     </button>
-                                    {changeErrors[stateKey] ? (
-                                      <span className="max-w-20 truncate text-[10px] text-red-300" title={changeErrors[stateKey]}>
-                                        {changeErrors[stateKey]}
-                                      </span>
-                                    ) : null}
+
+                                    {openCommentKey === stateKey && (
+                                      <div className="absolute right-0 top-8 z-30 w-96 rounded border border-blue-500/40 bg-slate-950 p-3 shadow-[0_18px_60px_rgba(0,0,0,0.55),0_0_0_1px_rgba(59,130,246,0.18)]">
+                                        <div className="mb-2 flex items-center justify-between gap-3">
+                                          <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-blue-300">
+                                            <MessageSquare size={13} />
+                                            修改批注
+                                          </div>
+                                          <button
+                                            type="button"
+                                            onClick={() => setOpenCommentKey(null)}
+                                            className="rounded p-1 text-slate-500 hover:bg-slate-900 hover:text-slate-200"
+                                            aria-label="Close comment"
+                                          >
+                                            <X size={13} />
+                                          </button>
+                                        </div>
+                                        <textarea
+                                          value={changeNotes[stateKey] ?? ''}
+                                          onChange={(event) => setChangeNotes((current) => ({
+                                            ...current,
+                                            [stateKey]: event.target.value
+                                          }))}
+                                          onBlur={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
+                                            setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
+                                          })}
+                                          placeholder="备注"
+                                          rows={6}
+                                          className="max-h-48 min-h-28 w-full resize-y rounded border border-slate-800 bg-slate-900/80 px-3 py-2 text-[12px] leading-relaxed text-slate-100 outline-none placeholder:text-slate-600 focus:border-blue-500"
+                                        />
+                                        {changeErrors[stateKey] ? (
+                                          <div className="mt-2 rounded border border-red-400/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-200">
+                                            {changeErrors[stateKey]}
+                                          </div>
+                                        ) : null}
+                                        <div className="mt-3 flex items-center justify-between gap-2">
+                                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
+                                            {reviewedChanges[stateKey] ? 'Reviewed' : 'Pending Review'}
+                                          </span>
+                                          <button
+                                            type="button"
+                                            onClick={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
+                                              setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
+                                            })}
+                                            className="rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-slate-300 transition-colors hover:border-blue-500 hover:text-blue-300"
+                                          >
+                                            保存
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
                                   </span>
                                 ) : null}
                               </div>
@@ -2015,7 +2113,21 @@ const TurnDetailModal = ({ turn, onClose }: { turn: Turn, onClose: () => void })
 
 const RightPanel = ({ turns }: { turns: Turn[] }) => {
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null);
+  const [selectedTurnIds, setSelectedTurnIds] = useState<string[]>([]);
+  const [isBatchReviewOpen, setIsBatchReviewOpen] = useState(false);
   const sortedTurns = [...turns].reverse();
+  const selectedTurns = turns.filter((turn) => selectedTurnIds.includes(turn.id));
+
+  useEffect(() => {
+    setSelectedTurnIds((current) => current.filter((id) => turns.some((turn) => turn.id === id)));
+  }, [turns]);
+
+  const toggleSelectTurn = (turnId: string, event: React.MouseEvent) => {
+    event.stopPropagation();
+    setSelectedTurnIds((current) => (
+      current.includes(turnId) ? current.filter((id) => id !== turnId) : [...current, turnId]
+    ));
+  };
 
   return (
     <aside className="fixed right-0 top-12 w-80 h-[calc(100vh-48px)] bg-slate-950 border-l border-slate-800 flex flex-col z-30">
@@ -2026,6 +2138,15 @@ const RightPanel = ({ turns }: { turns: Turn[] }) => {
           </h2>
           <p className="text-[10px] text-slate-500 uppercase mt-1">Conversation Tasks</p>
         </div>
+        {selectedTurnIds.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setIsBatchReviewOpen(true)}
+            className="rounded border border-blue-500/50 bg-blue-500/15 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-blue-200 transition-colors hover:bg-blue-500/25"
+          >
+            审核 {selectedTurnIds.length}
+          </button>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 hide-scrollbar">
@@ -2039,22 +2160,54 @@ const RightPanel = ({ turns }: { turns: Turn[] }) => {
             <div 
               key={turn.id}
               onClick={() => setSelectedTurn(turn)}
-              className="group cursor-pointer border rounded-lg p-3 transition-all relative overflow-hidden bg-slate-900/40 border-slate-800 hover:border-slate-700"
+              className={`group cursor-pointer border rounded-lg p-3 transition-all relative overflow-hidden ${
+                selectedTurnIds.includes(turn.id)
+                  ? 'border-blue-500 bg-blue-500/10 shadow-[inset_0_0_0_1px_rgba(59,130,246,0.2)]'
+                  : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'
+              }`}
             >
               <div className="flex justify-between items-start mb-2 relative z-10">
                 <span className="text-[9px] text-slate-600 font-bold uppercase tracking-tighter">{turn.timestamp}</span>
-                <MessageSquare size={12} className="text-blue-400/60" />
+                <button
+                  type="button"
+                  onClick={(event) => toggleSelectTurn(turn.id, event)}
+                  className={`flex h-7 w-7 items-center justify-center rounded border-2 transition-colors ${
+                    selectedTurnIds.includes(turn.id)
+                      ? 'border-blue-400 bg-blue-500 text-white'
+                      : 'border-slate-600 bg-slate-950 text-transparent hover:border-blue-400 hover:bg-blue-500/10'
+                  }`}
+                  aria-label={selectedTurnIds.includes(turn.id) ? 'Unselect turn' : 'Select turn'}
+                >
+                  {selectedTurnIds.includes(turn.id) ? <Check size={15} /> : <span className="h-3 w-3 rounded-sm border border-slate-500" />}
+                </button>
               </div>
               <h3 className="mb-2 truncate text-xs font-bold text-blue-300">{turn.taskTitle || 'Untitled Task'}</h3>
               <p className="text-xs text-on-surface line-clamp-2 relative z-10">"{turn.userMessage}"</p>
-              <div className="mt-3 border-t border-slate-800 pt-2 text-[9px] font-bold uppercase tracking-widest text-slate-600">
-                {turn.modifiedFiles.length} changed file{turn.modifiedFiles.length === 1 ? '' : 's'}
+              <div className="mt-3 flex items-center justify-between border-t border-slate-800 pt-2 text-[9px] font-bold uppercase tracking-widest">
+                <span className="text-slate-600">{turn.modifiedFiles.length} changed file{turn.modifiedFiles.length === 1 ? '' : 's'}</span>
+                <button
+                  type="button"
+                  onClick={(event) => toggleSelectTurn(turn.id, event)}
+                  className={`rounded border px-2 py-1 transition-colors ${
+                    selectedTurnIds.includes(turn.id)
+                      ? 'border-blue-400/60 bg-blue-500/15 text-blue-200'
+                      : 'border-slate-700 text-slate-500 hover:border-blue-500 hover:text-blue-300'
+                  }`}
+                >
+                  {selectedTurnIds.includes(turn.id) ? '已选择' : '选择此对话'}
+                </button>
               </div>
             </div>
           ))
         )}
       </div>
       <AnimatePresence>
+        {isBatchReviewOpen && selectedTurns.length > 0 && (
+          <ComparisonModal
+            turns={selectedTurns}
+            onClose={() => setIsBatchReviewOpen(false)}
+          />
+        )}
         {selectedTurn && (
           <TurnDetailModal turn={selectedTurn} onClose={() => setSelectedTurn(null)} />
         )}
@@ -2163,6 +2316,27 @@ export default function App() {
       setSelectedTurns([]);
     }
     await loadWorkspaces();
+  };
+
+  const handleDeleteSession = async (sessionId: string) => {
+    const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, {
+      method: 'DELETE'
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to delete session');
+    }
+
+    setProjects(prev => prev.map(project => ({
+      ...project,
+      items: project.items.filter(item => item.id !== sessionId)
+    })));
+    setSessionTurns(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => id !== sessionId)));
+    setSessionStatuses(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => id !== sessionId)));
+    if (activeItem === sessionId) {
+      setActiveItem(null);
+      setSelectedTurns([]);
+    }
   };
 
   const handleNewSession = async (projectId: string, provider: AgentProvider) => {
@@ -2319,6 +2493,9 @@ export default function App() {
           onDeleteProject={(projectId) => {
             setDeleteError('');
             setPendingDeleteProjectId(projectId);
+          }}
+          onDeleteSession={(sessionId) => {
+            handleDeleteSession(sessionId).catch((error) => console.error(error));
           }}
         />
         <main className="flex-1 min-h-0 ml-64 mr-80 overflow-hidden flex flex-col relative bg-slate-950/20">

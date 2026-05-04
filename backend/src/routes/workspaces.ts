@@ -1,7 +1,8 @@
-import { AgentProvider } from '@prisma/client';
+import { AgentProvider } from '../../node_modules/.prisma/workspace-client/index.js';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../db/prisma.js';
+import { ensureReviewdock, findSessionContext } from '../db/workspace-prisma.js';
 
 const createWorkspaceSchema = z.object({
   name: z.string().trim().min(1),
@@ -27,20 +28,23 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
   app.get('/workspaces', async () => {
     const workspaces = await prisma.workspace.findMany({
       where: { deletedAt: null },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        sessions: {
-          orderBy: { createdAt: 'asc' }
-        }
-      }
+      orderBy: { createdAt: 'desc' }
     });
 
-    return workspaces.map((workspace) => ({
-      ...workspace,
-      sessions: workspace.sessions.map((session) => ({
-        ...session,
-        provider: providerFromDb(session.provider)
-      }))
+    return Promise.all(workspaces.map(async (workspace) => {
+      const db = await ensureReviewdock(workspace.path);
+      const sessions = await db.session.findMany({
+        where: { deletedAt: null },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      return {
+        ...workspace,
+        sessions: sessions.map((session) => ({
+          ...session,
+          provider: providerFromDb(session.provider)
+        }))
+      };
     }));
   });
 
@@ -49,6 +53,8 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
     if (!parsed.success) {
       return reply.code(400).send({ error: 'Invalid workspace payload', issues: parsed.error.issues });
     }
+
+    await ensureReviewdock(parsed.data.path);
 
     const workspace = await prisma.workspace.create({
       data: parsed.data
@@ -83,6 +89,27 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
     return reply.code(204).send();
   });
 
+  app.delete('/sessions/:sessionId', async (request, reply) => {
+    const params = z.object({ sessionId: z.string().min(1) }).safeParse(request.params);
+
+    if (!params.success) {
+      return reply.code(400).send({ error: 'Invalid session id', issues: params.error.issues });
+    }
+
+    const context = await findSessionContext(params.data.sessionId);
+
+    if (!context?.session) {
+      return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    await context.db.session.update({
+      where: { id: context.session.id },
+      data: { deletedAt: new Date() }
+    });
+
+    return reply.code(204).send();
+  });
+
   app.post('/workspaces/:workspaceId/sessions', async (request, reply) => {
     const params = z.object({ workspaceId: z.string().min(1) }).safeParse(request.params);
     const body = createSessionSchema.safeParse(request.body);
@@ -98,24 +125,25 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
       where: {
         id: params.data.workspaceId,
         deletedAt: null
-      },
-      include: { sessions: true }
+      }
     });
 
     if (!workspace) {
       return reply.code(404).send({ error: 'Workspace not found' });
     }
 
+    const db = await ensureReviewdock(workspace.path);
+    const sessionCount = await db.session.count({ where: { deletedAt: null } });
     const providerLabel = body.data.provider === 'codex'
       ? 'Codex SDK'
       : body.data.provider === 'codex-cli'
         ? 'Codex CLI'
         : 'Cursor';
-    const session = await prisma.session.create({
+    const session = await db.session.create({
       data: {
         workspaceId: workspace.id,
         provider: providerToDb(body.data.provider),
-        name: body.data.name ?? `${providerLabel} Session ${workspace.sessions.length + 1}`
+        name: body.data.name ?? `${providerLabel} Session ${sessionCount + 1}`
       }
     });
 

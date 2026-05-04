@@ -1,4 +1,4 @@
-import { AgentProvider } from '@prisma/client';
+import { AgentProvider } from '../../node_modules/.prisma/workspace-client/index.js';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { execFile as execFileCallback } from 'node:child_process';
 import { createWriteStream, type Dirent } from 'node:fs';
@@ -7,7 +7,7 @@ import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import { runAgentExplanation, runAgentTurn, type AgentAttachment, type CodexRunOptions } from '../agents/providers.js';
-import { prisma } from '../db/prisma.js';
+import { findSessionContext, findTurnContext, workspaceUploadsDir } from '../db/workspace-prisma.js';
 import { resolveCodexRunOptions } from '../services/codex-options.js';
 import { extractTaskTitle } from '../services/task-title.js';
 
@@ -49,10 +49,10 @@ const imageExtensions: Record<string, string> = {
   'image/webp': '.webp'
 };
 const maxImageAttachments = 5;
-const uploadRoot = join(process.cwd(), 'uploads', 'sessions');
 const maxSnapshotFileBytes = 1024 * 1024;
 const ignoredSnapshotDirs = new Set([
   '.git',
+  '.reviewdock',
   'node_modules',
   'dist',
   'build',
@@ -121,7 +121,7 @@ const shouldSnapshotFile = async (filePath: string) => {
   }
 };
 
-const snapshotWorkspace = async (workspacePath: string) => {
+export const snapshotWorkspace = async (workspacePath: string) => {
   const root = resolve(workspacePath);
   const snapshot = new Map<string, string>();
 
@@ -155,7 +155,7 @@ const snapshotWorkspace = async (workspacePath: string) => {
   return snapshot;
 };
 
-const diffWorkspaceSnapshots = async (workspacePath: string, beforeSnapshot: Map<string, string>) => {
+export const diffWorkspaceSnapshots = async (workspacePath: string, beforeSnapshot: Map<string, string>) => {
   const afterSnapshot = await snapshotWorkspace(workspacePath);
   const paths = new Set([...beforeSnapshot.keys(), ...afterSnapshot.keys()]);
   const changes: Array<{ path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }> = [];
@@ -188,7 +188,7 @@ const corsOriginForRequest = (origin: string | undefined) => {
   return undefined;
 };
 
-const parseTurnPayload = async (request: FastifyRequest, sessionId: string) => {
+const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, sessionId: string) => {
   if (!request.isMultipart()) {
     const body = sendMessageSchema.safeParse(request.body);
     if (!body.success) {
@@ -205,7 +205,7 @@ const parseTurnPayload = async (request: FastifyRequest, sessionId: string) => {
     };
   }
 
-  const uploadDir = join(uploadRoot, sessionId);
+  const uploadDir = join(workspaceUploadsDir(workspacePath), 'sessions', sessionId);
   await mkdir(uploadDir, { recursive: true });
 
   let prompt = '';
@@ -303,15 +303,18 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Invalid turn id', issues: params.error.issues });
     }
 
-    const turn = await prisma.turn.findFirst({
-      where: {
-        id: params.data.turnId,
-        session: { workspace: { deletedAt: null } }
-      },
+    const context = await findTurnContext(params.data.turnId);
+
+    if (!context?.turn) {
+      return reply.code(404).send({ error: 'Turn not found' });
+    }
+
+    const turn = await context.db.turn.findFirst({
+      where: { id: params.data.turnId },
       include: {
         modifiedFiles: { orderBy: { createdAt: 'asc' } },
         reviewNotes: { orderBy: { updatedAt: 'asc' } },
-        session: { include: { workspace: true } }
+        session: true
       }
     });
 
@@ -322,11 +325,11 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     const hydratedFiles = await Promise.all(turn.modifiedFiles.map(async (file) => {
       if (file.beforeContent !== null || file.afterContent !== null) return file;
 
-      const beforeContent = file.kind === 'add' ? null : await readBeforeContent(turn.session.workspace.path, file.path);
-      const afterContent = file.kind === 'delete' ? null : await readAfterContent(turn.session.workspace.path, file.path);
+      const beforeContent = file.kind === 'add' ? null : await readBeforeContent(context.workspace.path, file.path);
+      const afterContent = file.kind === 'delete' ? null : await readAfterContent(context.workspace.path, file.path);
       if (beforeContent === null && afterContent === null) return file;
 
-      return prisma.modifiedFile.update({
+      return context.db.modifiedFile.update({
         where: { id: file.id },
         data: {
           beforeContent,
@@ -355,15 +358,8 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       });
     }
 
-    const turn = await prisma.turn.findFirst({
-      where: {
-        id: params.data.turnId,
-        session: { workspace: { deletedAt: null } }
-      },
-      include: {
-        session: { include: { workspace: true } }
-      }
-    });
+    const context = await findTurnContext(params.data.turnId);
+    const turn = context?.turn;
 
     if (!turn) {
       return reply.code(404).send({ error: 'Turn not found' });
@@ -373,7 +369,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Change explanation is only available for Codex sessions.' });
     }
 
-    if (!turn.session.workspace.path || !resolveWorkspaceFilePath(turn.session.workspace.path, body.data.filePath)) {
+    if (!context.workspace.path || !resolveWorkspaceFilePath(context.workspace.path, body.data.filePath)) {
       return reply.code(400).send({ error: 'Invalid file path' });
     }
 
@@ -384,13 +380,13 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         turn.session.provider,
         turn.session.id,
         turn.session.externalSessionId,
-        turn.session.workspace.path,
+        context.workspace.path,
         prompt,
         options
       );
 
       if (explanation.externalSessionId && explanation.externalSessionId !== turn.session.externalSessionId) {
-        await prisma.session.update({
+        await context.db.session.update({
           where: { id: turn.session.id },
           data: { externalSessionId: explanation.externalSessionId }
         });
@@ -398,7 +394,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
 
       const note = cleanExplanationText(explanation.text);
 
-      await prisma.reviewChangeNote.upsert({
+      await context.db.reviewChangeNote.upsert({
         where: {
           turnId_filePath_groupId: {
             turnId: turn.id,
@@ -442,18 +438,14 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       });
     }
 
-    const turn = await prisma.turn.findFirst({
-      where: {
-        id: params.data.turnId,
-        session: { workspace: { deletedAt: null } }
-      }
-    });
+    const context = await findTurnContext(params.data.turnId);
+    const turn = context?.turn;
 
     if (!turn) {
       return reply.code(404).send({ error: 'Turn not found' });
     }
 
-    const note = await prisma.reviewChangeNote.upsert({
+    const note = await context.db.reviewChangeNote.upsert({
       where: {
         turnId_filePath_groupId: {
           turnId: turn.id,
@@ -483,11 +475,13 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Invalid session id', issues: params.error.issues });
     }
 
-    const session = await prisma.session.findFirst({
-      where: {
-        id: params.data.sessionId,
-        workspace: { deletedAt: null }
-      },
+    const context = await findSessionContext(params.data.sessionId);
+    if (!context?.session) {
+      return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    const session = await context.db.session.findFirst({
+      where: { id: params.data.sessionId, deletedAt: null },
       include: {
         messages: { orderBy: { createdAt: 'asc' } },
         turns: {
@@ -522,25 +516,19 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       });
     }
 
-    const body = await parseTurnPayload(request, params.data.sessionId);
+    const context = await findSessionContext(params.data.sessionId);
+    const session = context?.session;
+    if (!session) {
+      return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    const body = await parseTurnPayload(request, context.workspace.path, params.data.sessionId);
 
     if (!body.success) {
       return reply.code(400).send({
         error: 'Invalid turn payload',
         issues: body.issues
       });
-    }
-
-    const session = await prisma.session.findFirst({
-      where: {
-        id: params.data.sessionId,
-        workspace: { deletedAt: null }
-      },
-      include: { workspace: true }
-    });
-
-    if (!session) {
-      return reply.code(404).send({ error: 'Session not found' });
     }
 
     const corsOrigin = corsOriginForRequest(request.headers.origin);
@@ -560,7 +548,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
 
     const taskTitle = await extractTaskTitle(body.prompt);
 
-    const userMessage = await prisma.message.create({
+    const userMessage = await context.db.message.create({
       data: {
         sessionId: session.id,
         role: 'user',
@@ -568,7 +556,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         taskTitle
       }
     });
-    const turn = await prisma.turn.create({
+    const turn = await context.db.turn.create({
       data: {
         sessionId: session.id,
         userMessageId: userMessage.id,
@@ -589,25 +577,26 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       provider: providerFromDb(session.provider),
       model: body.options.model,
       reasoningEffort: body.options.modelReasoningEffort,
-      workspacePath: session.workspace.path
+      workspacePath: context.workspace.path
     });
     if (body.attachments.length > 0) {
       writeSse(reply.raw, 'status', {
         status: 'analyzing_images',
         attachmentCount: body.attachments.length,
         attachmentPaths: body.attachments.map((attachment) => attachment.path),
-        model: body.options.model
+        model: body.options.model,
+        timeoutSeconds: body.options.imageTurnTimeoutMs > 0 ? Math.floor(body.options.imageTurnTimeoutMs / 1000) : null
       });
     }
 
-    const beforeSnapshot = await snapshotWorkspace(session.workspace.path);
+    const beforeSnapshot = await snapshotWorkspace(context.workspace.path);
     let assistantContent = '';
     const modifiedFiles = new Map<string, { path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }>();
 
     try {
-      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, session.workspace.path, body.prompt, body.attachments, body.options)) {
+      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, context.workspace.path, body.prompt, body.attachments, body.options)) {
         if (chunk.externalSessionId && chunk.externalSessionId !== session.externalSessionId) {
-          await prisma.session.update({
+          await context.db.session.update({
             where: { id: session.id },
             data: { externalSessionId: chunk.externalSessionId }
           });
@@ -616,11 +605,11 @@ export async function registerSessionRoutes(app: FastifyInstance) {
 
         if (chunk.type === 'file_change' && chunk.changes) {
           for (const change of chunk.changes) {
-            const normalizedPath = normalizeWorkspaceFilePath(session.workspace.path, change.path);
+            const normalizedPath = normalizeWorkspaceFilePath(context.workspace.path, change.path);
             const beforeContent = change.kind === 'add'
               ? null
-              : beforeSnapshot.get(normalizedPath) ?? await readBeforeContent(session.workspace.path, change.path);
-            const afterContent = change.kind === 'delete' ? null : await readAfterContent(session.workspace.path, change.path);
+              : beforeSnapshot.get(normalizedPath) ?? await readBeforeContent(context.workspace.path, change.path);
+            const afterContent = change.kind === 'delete' ? null : await readAfterContent(context.workspace.path, change.path);
             modifiedFiles.set(`${change.kind}:${normalizedPath}`, { ...change, path: normalizedPath, beforeContent, afterContent, content: afterContent });
           }
           writeSse(reply.raw, 'file_change', { turnId: turn.id, changes: chunk.changes });
@@ -642,7 +631,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       }
 
       if (session.provider === AgentProvider.CODEX_CLI && modifiedFiles.size === 0) {
-        const snapshotChanges = await diffWorkspaceSnapshots(session.workspace.path, beforeSnapshot);
+        const snapshotChanges = await diffWorkspaceSnapshots(context.workspace.path, beforeSnapshot);
         for (const change of snapshotChanges) {
           modifiedFiles.set(`${change.kind}:${change.path}`, change);
         }
@@ -655,7 +644,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       }
 
       if (assistantContent.trim()) {
-        await prisma.message.create({
+        await context.db.message.create({
           data: {
             sessionId: session.id,
             role: 'assistant',
@@ -663,7 +652,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
           }
         });
       }
-      await prisma.turn.update({
+      await context.db.turn.update({
         where: { id: turn.id },
         data: {
           assistantContent: assistantContent.trim() || null,
