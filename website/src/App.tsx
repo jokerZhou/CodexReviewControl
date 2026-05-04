@@ -2435,12 +2435,14 @@ const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], work
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null);
   const [selectedTurnIds, setSelectedTurnIds] = useState<string[]>([]);
   const [isBatchReviewOpen, setIsBatchReviewOpen] = useState(false);
-  const sortedTurns = [...turns].reverse();
-  const selectedTurns = turns.filter((turn) => selectedTurnIds.includes(turn.id));
+  const [showChangedOnly, setShowChangedOnly] = useState(false);
+  const visibleTurns = showChangedOnly ? turns.filter((turn) => turn.modifiedFiles.length > 0) : turns;
+  const sortedTurns = [...visibleTurns].reverse();
+  const selectedTurns = visibleTurns.filter((turn) => selectedTurnIds.includes(turn.id));
 
   useEffect(() => {
-    setSelectedTurnIds((current) => current.filter((id) => turns.some((turn) => turn.id === id)));
-  }, [turns]);
+    setSelectedTurnIds((current) => current.filter((id) => visibleTurns.some((turn) => turn.id === id)));
+  }, [visibleTurns]);
 
   const toggleSelectTurn = (turnId: string, event: React.MouseEvent) => {
     event.stopPropagation();
@@ -2480,11 +2482,28 @@ const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], work
         </div>
       </div>
 
+      <div className="border-b border-slate-900 px-4 py-2">
+        <label className="flex cursor-pointer items-center justify-between gap-3 rounded border border-slate-800 bg-slate-900/40 px-3 py-2 transition-colors hover:border-slate-700">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">只显示有文件修改</span>
+          <input
+            type="checkbox"
+            checked={showChangedOnly}
+            onChange={(event) => setShowChangedOnly(event.target.checked)}
+            className="h-4 w-4 accent-blue-500"
+          />
+        </label>
+      </div>
+
       <div className="flex-1 overflow-y-auto p-4 space-y-4 hide-scrollbar">
         {turns.length === 0 ? (
           <div className="h-40 flex flex-col items-center justify-center opacity-20 text-center px-4">
             <MessageSquare size={32} className="mb-2" />
             <p className="text-[10px] uppercase font-bold tracking-widest">No conversation tracking active</p>
+          </div>
+        ) : visibleTurns.length === 0 ? (
+          <div className="h-40 flex flex-col items-center justify-center opacity-20 text-center px-4">
+            <GitBranch size={32} className="mb-2" />
+            <p className="text-[10px] uppercase font-bold tracking-widest">No conversations with file changes</p>
           </div>
         ) : (
           sortedTurns.map((turn) => (
