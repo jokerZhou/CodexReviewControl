@@ -4,6 +4,7 @@ import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 import { env } from './config/env.js';
 import { registerAgentOptionsRoutes } from './routes/agent-options.js';
+import { registerCodeBrowserRoutes } from './routes/code-browser.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerSessionRoutes } from './routes/sessions.js';
 import { registerSystemRoutes } from './routes/system.js';
@@ -39,6 +40,7 @@ export async function buildApp() {
   await registerHealthRoutes(app);
   await registerSystemRoutes(app);
   await registerWorkspaceRoutes(app);
+  await registerCodeBrowserRoutes(app);
   await registerAgentOptionsRoutes(app);
   await registerSessionRoutes(app);
   await registerTerminalRoutes(app);

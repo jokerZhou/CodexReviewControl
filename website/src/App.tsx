@@ -4,6 +4,7 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
@@ -448,6 +449,7 @@ interface Turn {
   userMessage: string;
   taskTitle?: string;
   timestamp: string;
+  workspaceId?: string;
   modifiedFiles: ModifiedFile[];
   reasoning: { issue: string; solution: string };
   summary: string;
@@ -551,6 +553,30 @@ interface ApiTurn {
   createdAt: string;
   modifiedFiles: ApiModifiedFile[];
   reviewNotes?: ApiReviewChangeNote[];
+}
+
+interface CodeFileEntry {
+  name: string;
+  path: string;
+  type: 'directory' | 'file';
+}
+
+interface CodeHistoryEntry {
+  turnId: string;
+  taskTitle?: string | null;
+  prompt: string;
+  createdAt: string;
+  completedAt?: string | null;
+  sessionId: string;
+  sessionName: string;
+  provider: AgentProvider;
+  filePath: string;
+  changeKind: 'add' | 'delete' | 'update';
+  changedLines: number[];
+  beforeExcerpt: string;
+  afterExcerpt: string;
+  beforeContent?: string | null;
+  afterContent?: string | null;
 }
 
 interface PendingAttachment {
@@ -961,8 +987,8 @@ const ConfirmDeleteWorkspaceModal = ({ project, error, isDeleting, onClose, onCo
   );
 };
 
-const ComparisonModal = ({ turns, onClose }: { turns: Turn[], onClose: () => void }) => {
-  return <TurnDetailModal turn={turns[0]} turns={turns} onClose={onClose} />;
+const ComparisonModal = ({ turns, workspace, onClose }: { turns: Turn[], workspace?: WorkspaceProject, onClose: () => void }) => {
+  return <TurnDetailModal turn={turns[0]} turns={turns} workspace={workspace} onClose={onClose} />;
 };
 
 const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, onNewSession, onOpenAddProject, onDeleteProject, onDeleteSession }: { activeItem: string | null, setActiveItem: (id: string) => void, projects: WorkspaceProject[], sessionStatuses: Record<string, AgentRunStatus>, onNewSession: (projectId: string) => void, onOpenAddProject: () => void, onDeleteProject: (projectId: string) => void, onDeleteSession: (sessionId: string) => void }) => {
@@ -1542,7 +1568,80 @@ const findFirstTurnWithFilesIndex = (items: Turn[]) => {
   return index >= 0 ? index : 0;
 };
 
-const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[], onClose: () => void }) => {
+const ReviewCommentDialog = ({
+  note,
+  reviewed,
+  error,
+  onChangeNote,
+  onClose,
+  onSave
+}: {
+  note: string;
+  reviewed: boolean;
+  error?: string;
+  onChangeNote: (note: string) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) => {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="fixed right-10 top-36 z-[1000] w-[34rem] rounded border border-blue-500/50 bg-slate-950 p-4 shadow-[0_24px_90px_rgba(0,0,0,0.85),0_0_0_1px_rgba(59,130,246,0.28)]">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-blue-300">
+          <MessageSquare size={14} />
+          修改批注
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded p-1 text-slate-500 hover:bg-slate-900 hover:text-slate-200"
+          aria-label="Close comment"
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <textarea
+        value={note}
+        onChange={(event) => onChangeNote(event.target.value)}
+        onBlur={onSave}
+        placeholder="备注"
+        rows={7}
+        className="max-h-64 min-h-36 w-full resize-y rounded border border-slate-800 bg-slate-900/90 px-3 py-2 text-[13px] leading-relaxed text-slate-100 outline-none placeholder:text-slate-600 focus:border-blue-500"
+      />
+      {error ? (
+        <div className="mt-2 rounded border border-red-400/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-200">
+          {error}
+        </div>
+      ) : null}
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
+          {reviewed ? 'Reviewed' : 'Pending Review'}
+        </span>
+        <button
+          type="button"
+          onClick={onSave}
+          className="rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-slate-300 transition-colors hover:border-blue-500 hover:text-blue-300"
+        >
+          保存
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+};
+
+const TurnDetailModal = ({ turn, turns, workspace, onClose }: { turn: Turn, turns?: Turn[], workspace?: WorkspaceProject, onClose: () => void }) => {
   const initialTurns = turns && turns.length > 0 ? turns : [turn];
   const [detailTurns, setDetailTurns] = useState<Turn[]>(initialTurns);
   const [selectedTurnIndex, setSelectedTurnIndex] = useState(() => findFirstTurnWithFilesIndex(initialTurns));
@@ -1556,6 +1655,11 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
   const [openCommentKey, setOpenCommentKey] = useState<string | null>(null);
   const [isUnreviewedOpen, setIsUnreviewedOpen] = useState(false);
   const [pendingReviewJump, setPendingReviewJump] = useState<{ fileIndex: number; groupId: string } | null>(null);
+  const [storySelection, setStorySelection] = useState<{ text: string; startLine: number; endLine: number } | null>(null);
+  const [storyEntries, setStoryEntries] = useState<CodeHistoryEntry[]>([]);
+  const [isStoryLoading, setIsStoryLoading] = useState(false);
+  const [storyError, setStoryError] = useState('');
+  const [isStoryDialogOpen, setIsStoryDialogOpen] = useState(false);
   const annotatedScrollRef = useRef<HTMLDivElement | null>(null);
   const ignoreNextAnnotatedScrollRef = useRef(false);
   const detailTurn = detailTurns[selectedTurnIndex] || initialTurns[0] || turn;
@@ -1607,6 +1711,10 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
   useEffect(() => {
     setReviewMode('annotated');
     setActiveChangeRowId(null);
+    setStorySelection(null);
+    setStoryEntries([]);
+    setStoryError('');
+    setIsStoryDialogOpen(false);
     annotatedScrollRef.current?.scrollTo({ top: 0 });
   }, [selectedFileIndex, selectedTurnIndex]);
 
@@ -1614,6 +1722,10 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
     setSelectedFileIndex(0);
     setActiveChangeRowId(null);
     setOpenCommentKey(null);
+    setStorySelection(null);
+    setStoryEntries([]);
+    setStoryError('');
+    setIsStoryDialogOpen(false);
   }, [selectedTurnIndex]);
 
   const selectedFile = detailTurn.modifiedFiles[selectedFileIndex];
@@ -1693,6 +1805,59 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
     if (ignoreNextAnnotatedScrollRef.current) {
       ignoreNextAnnotatedScrollRef.current = false;
     }
+  };
+  const querySelectedCodeStory = async (selection: { text: string; startLine: number; endLine: number }) => {
+    if (!workspace || !selectedFile || !selection.text.trim()) return;
+
+    setIsStoryLoading(true);
+    setStoryError('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/workspaces/${workspace.id}/code-history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: selectedFile.name,
+          selectedText: selection.text,
+          startLine: selection.startLine,
+          endLine: selection.endLine
+        })
+      });
+
+      if (!response.ok) throw new Error('加载故事线失败');
+      const payload = await response.json() as { entries: CodeHistoryEntry[] };
+      setStoryEntries(payload.entries);
+    } catch (error) {
+      setStoryError(error instanceof Error ? error.message : '加载故事线失败');
+    } finally {
+      setIsStoryLoading(false);
+    }
+  };
+  const handleReviewCodeSelection = () => {
+    if (!workspace || !selectedFile) return;
+    const selectedText = window.getSelection()?.toString() ?? '';
+    if (!selectedText.trim()) return;
+
+    const browserSelection = window.getSelection();
+    const anchorElement = browserSelection?.anchorNode?.parentElement?.closest('[data-review-line-number]') as HTMLElement | null;
+    const focusElement = browserSelection?.focusNode?.parentElement?.closest('[data-review-line-number]') as HTMLElement | null;
+    const anchorLine = Number(anchorElement?.dataset.reviewLineNumber);
+    const focusLine = Number(focusElement?.dataset.reviewLineNumber);
+    const domLines = [anchorLine, focusLine].filter((lineNumber) => Number.isFinite(lineNumber) && lineNumber > 0);
+    const lineMatches = domLines.length > 0
+      ? domLines
+      : annotatedRows
+        .filter((row) => row.text && selectedText.includes(row.text.trim()))
+        .map((row) => row.lineNumber)
+        .filter((lineNumber): lineNumber is number => typeof lineNumber === 'number');
+    const fallbackLine = annotatedRows.find((row) => row.lineNumber !== null)?.lineNumber ?? 1;
+    const selection = {
+      text: selectedText,
+      startLine: lineMatches.length > 0 ? Math.min(...lineMatches) : fallbackLine,
+      endLine: lineMatches.length > 0 ? Math.max(...lineMatches) : fallbackLine
+    };
+
+    setStorySelection(selection);
+    querySelectedCodeStory(selection).catch(() => undefined);
   };
   const jumpToReviewItem = (fileIndex: number, groupId: string) => {
     setIsUnreviewedOpen(false);
@@ -1959,8 +2124,8 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                   </div>
                 </div>
                 {reviewMode === 'annotated' && selectedFile?.status === 'M' ? (
-                  <div className="flex min-h-0 flex-1 bg-slate-950/40">
-                    <div ref={annotatedScrollRef} onScroll={handleAnnotatedScroll} className="min-w-0 flex-1 overflow-y-auto p-4 hide-scrollbar">
+                  <div className="relative flex min-h-0 flex-1 bg-slate-950/40">
+                    <div ref={annotatedScrollRef} onScroll={handleAnnotatedScroll} onMouseUp={handleReviewCodeSelection} className="min-w-0 flex-1 overflow-y-auto p-4 hide-scrollbar">
                       <div className="mb-3 flex items-center justify-between gap-3">
                         <div className="text-[10px] font-bold uppercase tracking-widest text-blue-400">Current Code With Changes</div>
                         <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest">
@@ -1981,13 +2146,19 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                             const isGroupFirstRow = group?.rows[0]?.id === row.id;
                             const isActiveGroup = activeChangeRowId === groupId;
                             const stateKey = groupId ? changeStateKey(groupId) : '';
+                            const isCommentOpen = openCommentKey === stateKey;
 
                             return (
                               <div
                                 id={row.id}
                                 key={row.id}
+                                data-review-line-number={row.lineNumber ?? undefined}
                                 className={`group flex scroll-mt-6 items-start border-l-2 px-2 py-0.5 transition-all duration-300 ${
-                                  isActiveGroup ? 'relative z-10 scale-[1.015] shadow-[0_0_0_1px_rgba(96,165,250,0.65),0_0_28px_rgba(59,130,246,0.35)]' : ''
+                                  openCommentKey
+                                    ? 'relative z-[100]'
+                                    : isActiveGroup
+                                      ? 'relative scale-[1.015] shadow-[0_0_0_1px_rgba(96,165,250,0.65),0_0_28px_rgba(59,130,246,0.35)]'
+                                      : ''
                                 } ${
                                   row.kind === 'add'
                                     ? isActiveGroup ? 'border-green-200 bg-green-400/25 text-green-50' : 'border-green-400 bg-green-500/10 text-green-100'
@@ -2025,11 +2196,17 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                                 )}
                                 {groupId ? (
                                   <span className={`relative ml-3 flex w-[24rem] shrink-0 items-center justify-end gap-2 transition-opacity ${
+                                    isCommentOpen ? 'z-[110]' : ''
+                                  } ${
                                     isGroupFirstRow ? 'opacity-90 group-hover:opacity-100' : 'pointer-events-none invisible'
                                   }`}>
                                     <button
                                       type="button"
-                                      onClick={() => setOpenCommentKey(openCommentKey === stateKey ? null : stateKey)}
+                                      onClick={() => {
+                                        setIsStoryDialogOpen(false);
+                                        setActiveChangeRowId(null);
+                                        setOpenCommentKey(openCommentKey === stateKey ? null : stateKey);
+                                      }}
                                       className={`flex min-w-0 flex-1 items-center gap-2 rounded border px-2 py-1 text-left text-[11px] transition-colors ${
                                         reviewedChanges[stateKey]
                                           ? 'border-green-400/40 bg-green-500/10 text-green-100'
@@ -2062,55 +2239,20 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                                       {reviewedChanges[stateKey] ? '已审' : '审核'}
                                     </button>
 
-                                    {openCommentKey === stateKey && (
-                                      <div className="absolute right-0 top-8 z-30 w-96 rounded border border-blue-500/40 bg-slate-950 p-3 shadow-[0_18px_60px_rgba(0,0,0,0.55),0_0_0_1px_rgba(59,130,246,0.18)]">
-                                        <div className="mb-2 flex items-center justify-between gap-3">
-                                          <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-blue-300">
-                                            <MessageSquare size={13} />
-                                            修改批注
-                                          </div>
-                                          <button
-                                            type="button"
-                                            onClick={() => setOpenCommentKey(null)}
-                                            className="rounded p-1 text-slate-500 hover:bg-slate-900 hover:text-slate-200"
-                                            aria-label="Close comment"
-                                          >
-                                            <X size={13} />
-                                          </button>
-                                        </div>
-                                        <textarea
-                                          value={changeNotes[stateKey] ?? ''}
-                                          onChange={(event) => setChangeNotes((current) => ({
-                                            ...current,
-                                            [stateKey]: event.target.value
-                                          }))}
-                                          onBlur={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
-                                            setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
-                                          })}
-                                          placeholder="备注"
-                                          rows={6}
-                                          className="max-h-48 min-h-28 w-full resize-y rounded border border-slate-800 bg-slate-900/80 px-3 py-2 text-[12px] leading-relaxed text-slate-100 outline-none placeholder:text-slate-600 focus:border-blue-500"
-                                        />
-                                        {changeErrors[stateKey] ? (
-                                          <div className="mt-2 rounded border border-red-400/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-200">
-                                            {changeErrors[stateKey]}
-                                          </div>
-                                        ) : null}
-                                        <div className="mt-3 flex items-center justify-between gap-2">
-                                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
-                                            {reviewedChanges[stateKey] ? 'Reviewed' : 'Pending Review'}
-                                          </span>
-                                          <button
-                                            type="button"
-                                            onClick={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
-                                              setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
-                                            })}
-                                            className="rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-slate-300 transition-colors hover:border-blue-500 hover:text-blue-300"
-                                          >
-                                            保存
-                                          </button>
-                                        </div>
-                                      </div>
+                                    {isCommentOpen && (
+                                      <ReviewCommentDialog
+                                        note={changeNotes[stateKey] ?? ''}
+                                        reviewed={reviewedChanges[stateKey] ?? false}
+                                        error={changeErrors[stateKey]}
+                                        onChangeNote={(note) => setChangeNotes((current) => ({
+                                          ...current,
+                                          [stateKey]: note
+                                        }))}
+                                        onClose={() => setOpenCommentKey(null)}
+                                        onSave={() => persistChangeNote(groupId, changeNotes[stateKey] ?? '', reviewedChanges[stateKey] ?? false).catch(() => {
+                                          setChangeErrors((current) => ({ ...current, [stateKey]: '保存备注失败' }));
+                                        })}
+                                      />
                                     )}
                                   </span>
                                 ) : null}
@@ -2139,6 +2281,58 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                             aria-label={`Jump to ${group.kind} change group`}
                           />
                         ))}
+                      </div>
+                    )}
+                    {storySelection && !openCommentKey && (
+                      <div className="absolute right-8 top-4 z-20 flex max-h-[calc(100%-2rem)] w-80 flex-col rounded border border-slate-800 bg-slate-950/95 shadow-[0_18px_60px_rgba(0,0,0,0.55)] backdrop-blur">
+                        <div className="flex items-start justify-between gap-3 border-b border-slate-800 p-3">
+                          <div className="min-w-0">
+                            <div className="text-[10px] font-bold uppercase tracking-widest text-blue-400">修改故事线</div>
+                            <div className="mt-1 text-[10px] text-slate-500">Lines {storySelection.startLine}-{storySelection.endLine}</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setStorySelection(null);
+                              setStoryEntries([]);
+                              setStoryError('');
+                              setIsStoryDialogOpen(false);
+                            }}
+                            className="rounded p-1 text-slate-500 hover:bg-slate-900 hover:text-slate-200"
+                            aria-label="Close story summary"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 hide-scrollbar">
+                          {storyError && <div className="mb-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{storyError}</div>}
+                          {isStoryLoading ? (
+                            <div className="py-8 text-center text-[10px] font-bold uppercase tracking-widest text-blue-400">Loading...</div>
+                          ) : storyEntries.length === 0 ? (
+                            <div className="py-8 text-center text-[10px] font-bold uppercase tracking-widest text-slate-600">No story for selection</div>
+                          ) : (
+                            <div className="space-y-2">
+                              {storyEntries.slice(0, 6).map((entry) => (
+                                <div key={`${entry.turnId}:${entry.filePath}`} className="rounded border border-slate-800 bg-slate-900/50 p-3">
+                                  <div className="mb-1 truncate text-[11px] font-bold text-blue-300">{entry.taskTitle || 'Untitled task'}</div>
+                                  <div className="mb-2 text-[9px] font-bold uppercase tracking-widest text-slate-500">{new Date(entry.createdAt).toLocaleString()}</div>
+                                  <p className="line-clamp-2 text-[11px] text-slate-300">{entry.prompt}</p>
+                                  <div className="mt-2 flex items-center gap-2 text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                                    <span>{entry.sessionName}</span>
+                                    <span>{entry.provider}</span>
+                                  </div>
+                                </div>
+                              ))}
+                              <button
+                                type="button"
+                                onClick={() => setIsStoryDialogOpen(true)}
+                                className="w-full rounded border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-blue-200 transition-colors hover:bg-blue-500/20"
+                              >
+                                查看代码故事线
+                              </button>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2221,12 +2415,23 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
             </div>
           )}
         </div>
+        <AnimatePresence>
+          {storySelection && isStoryDialogOpen && (
+            <CodeStoryDialog
+              selection={storySelection}
+              entries={storyEntries}
+              isLoading={isStoryLoading}
+              error={storyError}
+              onClose={() => setIsStoryDialogOpen(false)}
+            />
+          )}
+        </AnimatePresence>
       </motion.div>
     </motion.div>
   );
 };
 
-const RightPanel = ({ turns }: { turns: Turn[] }) => {
+const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], workspace?: WorkspaceProject, onOpenCodeStory: () => void }) => {
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null);
   const [selectedTurnIds, setSelectedTurnIds] = useState<string[]>([]);
   const [isBatchReviewOpen, setIsBatchReviewOpen] = useState(false);
@@ -2253,7 +2458,17 @@ const RightPanel = ({ turns }: { turns: Turn[] }) => {
           </h2>
           <p className="text-[10px] text-slate-500 uppercase mt-1">Conversation Tasks</p>
         </div>
-        {selectedTurnIds.length > 0 && (
+        <div className="flex items-center gap-2">
+          {workspace && (
+            <button
+              type="button"
+              onClick={onOpenCodeStory}
+              className="rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-slate-300 transition-colors hover:border-blue-500 hover:text-blue-300"
+            >
+              代码
+            </button>
+          )}
+          {selectedTurnIds.length > 0 && (
           <button
             type="button"
             onClick={() => setIsBatchReviewOpen(true)}
@@ -2261,7 +2476,8 @@ const RightPanel = ({ turns }: { turns: Turn[] }) => {
           >
             审核 {selectedTurnIds.length}
           </button>
-        )}
+          )}
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 hide-scrollbar">
@@ -2320,11 +2536,12 @@ const RightPanel = ({ turns }: { turns: Turn[] }) => {
         {isBatchReviewOpen && selectedTurns.length > 0 && (
           <ComparisonModal
             turns={selectedTurns}
+            workspace={workspace}
             onClose={() => setIsBatchReviewOpen(false)}
           />
         )}
         {selectedTurn && (
-          <TurnDetailModal turn={selectedTurn} onClose={() => setSelectedTurn(null)} />
+          <TurnDetailModal turn={selectedTurn} workspace={workspace} onClose={() => setSelectedTurn(null)} />
         )}
       </AnimatePresence>
     </aside>
@@ -2343,6 +2560,385 @@ const FileItem = ({ status, name, statusColor }: any) => {
   );
 };
 
+const CodeStoryDialog = ({ selection, entries, isLoading, error, onClose }: { selection: { text: string; startLine: number; endLine: number }, entries: CodeHistoryEntry[], isLoading: boolean, error: string, onClose: () => void }) => {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const selectedEntry = entries[selectedIndex] || entries[0];
+  const fileScrollRef = useRef<HTMLDivElement | null>(null);
+  const selectedRows = useMemo(() => {
+    if (!selectedEntry) return [];
+    return renderCompareRows(selectedEntry.beforeContent, selectedEntry.afterContent);
+  }, [selectedEntry]);
+  const targetRowIndex = useMemo(() => {
+    const selectedLineIndex = selectedRows.findIndex((row) => (
+      row.afterLineNumber !== null &&
+      row.afterLineNumber >= selection.startLine &&
+      row.afterLineNumber <= selection.endLine
+    ));
+    if (selectedLineIndex >= 0) return selectedLineIndex;
+
+    const firstChangedIndex = selectedRows.findIndex((row) => row.kind !== 'same');
+    return firstChangedIndex >= 0 ? firstChangedIndex : 0;
+  }, [selectedRows, selection.endLine, selection.startLine]);
+
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [entries]);
+
+  useEffect(() => {
+    window.setTimeout(() => {
+      const target = document.getElementById(`story-file-row-${targetRowIndex}`);
+      if (!target || !fileScrollRef.current) return;
+      fileScrollRef.current.scrollTo({
+        top: Math.max(0, target.offsetTop - fileScrollRef.current.offsetTop - 120),
+        behavior: 'smooth'
+      });
+    }, 0);
+  }, [targetRowIndex, selectedEntry?.turnId]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[130] flex items-center justify-center bg-slate-950/70 p-6 backdrop-blur-sm"
+    >
+      <motion.div
+        initial={{ y: 16, opacity: 0, scale: 0.98 }}
+        animate={{ y: 0, opacity: 1, scale: 1 }}
+        exit={{ y: 8, opacity: 0, scale: 0.98 }}
+        className="flex h-[82vh] w-[86vw] max-w-7xl flex-col overflow-hidden rounded-lg border border-slate-800 bg-slate-950 shadow-[0_24px_80px_rgba(0,0,0,0.65)]"
+      >
+        <div className="flex items-start justify-between gap-6 border-b border-slate-800 p-4">
+          <div className="min-w-0">
+            <h2 className="text-sm font-bold uppercase tracking-widest text-blue-400">修改故事线</h2>
+            <div className="mt-2 flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+              <span>Lines {selection.startLine}-{selection.endLine}</span>
+              <span>{entries.length} records</span>
+            </div>
+            <p className="mt-2 line-clamp-2 max-w-4xl text-xs text-slate-300">{selection.text.trim()}</p>
+          </div>
+          <button onClick={onClose} className="rounded p-1.5 text-slate-500 transition-colors hover:bg-slate-900 hover:text-slate-200" aria-label="Close story dialog">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="grid min-h-0 flex-1 grid-cols-12">
+          <div className="col-span-4 border-r border-slate-800 p-4">
+            {error && <div className="mb-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
+            {isLoading ? (
+              <div className="flex h-full items-center justify-center text-xs font-bold uppercase tracking-widest text-blue-400">Loading...</div>
+            ) : entries.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-center text-[11px] font-bold uppercase tracking-widest text-slate-600">No story for selection</div>
+            ) : (
+              <div className="h-full space-y-2 overflow-y-auto pr-1 hide-scrollbar">
+                {entries.map((entry, index) => (
+                  <button
+                    key={`${entry.turnId}:${entry.filePath}:${index}`}
+                    type="button"
+                    onClick={() => setSelectedIndex(index)}
+                    className={`w-full rounded border p-3 text-left transition-colors ${
+                      selectedIndex === index
+                        ? 'border-blue-500 bg-blue-500/10'
+                        : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="truncate text-xs font-bold text-blue-300">{entry.taskTitle || 'Untitled task'}</span>
+                      <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-slate-400">{entry.changeKind}</span>
+                    </div>
+                    <p className="mb-2 line-clamp-2 text-xs text-slate-300">{entry.prompt}</p>
+                    <div className="flex items-center justify-between gap-3 text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                      <span className="truncate">{entry.sessionName}</span>
+                      <span>{new Date(entry.createdAt).toLocaleString()}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="col-span-8 flex min-h-0 flex-col">
+            {selectedEntry ? (
+              <>
+                <div className="border-b border-slate-800 p-4">
+                  <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                    <span>{selectedEntry.provider}</span>
+                    <span>{selectedEntry.sessionName}</span>
+                    <span>{selectedEntry.filePath}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0 text-sm font-bold text-blue-200">{selectedEntry.taskTitle || 'Untitled task'}</div>
+                    <div className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                      Jumped to changed block
+                    </div>
+                  </div>
+                </div>
+                <div ref={fileScrollRef} className="min-h-0 flex-1 overflow-auto bg-slate-950/40 p-4 hide-scrollbar">
+                  <div className="mb-3 grid grid-cols-[5rem_minmax(0,1fr)_minmax(0,1fr)] gap-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                    <span>Line</span>
+                    <span className="text-red-300">Before</span>
+                    <span className="text-green-300">After</span>
+                  </div>
+                  <div className="font-mono text-xs leading-relaxed">
+                    {selectedRows.map((row, index) => (
+                      <div
+                        id={`story-file-row-${index}`}
+                        key={index}
+                        className={`grid grid-cols-[5rem_minmax(0,1fr)_minmax(0,1fr)] gap-3 border-l-2 px-2 py-1 ${
+                          row.kind === 'same'
+                            ? 'border-transparent text-slate-500'
+                            : row.kind === 'add'
+                              ? 'border-green-400 bg-green-500/10 text-green-100'
+                              : row.kind === 'delete'
+                                ? 'border-red-400 bg-red-500/10 text-red-100'
+                                : 'border-yellow-300 bg-yellow-400/10 text-slate-100'
+                        }`}
+                      >
+                        <div className="select-none text-right text-slate-600">
+                          {row.beforeLineNumber ?? row.afterLineNumber ?? '-'}
+                        </div>
+                        <pre className={`min-w-0 whitespace-pre-wrap rounded px-2 py-1 ${
+                          row.kind === 'delete' || row.kind === 'update' ? 'bg-red-500/10 text-red-100' : 'text-slate-600'
+                        }`}>
+                          {row.before || ' '}
+                        </pre>
+                        <pre className={`min-w-0 whitespace-pre-wrap rounded px-2 py-1 ${
+                          row.kind === 'add' || row.kind === 'update' ? 'bg-green-500/10 text-green-100' : 'text-slate-600'
+                        }`}>
+                          {row.after || ' '}
+                        </pre>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="flex h-full items-center justify-center text-[11px] font-bold uppercase tracking-widest text-slate-600">Select a story record</div>
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const CodeStoryModal = ({ workspace, onClose }: { workspace: WorkspaceProject, onClose: () => void }) => {
+  const [currentDir, setCurrentDir] = useState('');
+  const [entries, setEntries] = useState<CodeFileEntry[]>([]);
+  const [selectedFile, setSelectedFile] = useState('');
+  const [content, setContent] = useState('');
+  const [history, setHistory] = useState<CodeHistoryEntry[]>([]);
+  const [selection, setSelection] = useState<{ text: string; startLine: number; endLine: number } | null>(null);
+  const [error, setError] = useState('');
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+
+  const contentLines = useMemo(() => splitLines(content), [content]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const url = new URL(`${API_BASE_URL}/workspaces/${workspace.id}/files`);
+    if (currentDir) url.searchParams.set('path', currentDir);
+
+    fetch(url)
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to load files')))
+      .then((payload: { entries: CodeFileEntry[] }) => {
+        if (cancelled) return;
+        setEntries(payload.entries);
+        setError('');
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError(loadError instanceof Error ? loadError.message : 'Failed to load files');
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.id, currentDir]);
+
+  const openFile = async (path: string) => {
+    const url = new URL(`${API_BASE_URL}/workspaces/${workspace.id}/files/content`);
+    url.searchParams.set('path', path);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to load file content');
+    const payload = await response.json() as { content: string };
+    setSelectedFile(path);
+    setContent(payload.content);
+    setHistory([]);
+    setSelection(null);
+  };
+
+  const queryHistory = async (nextSelection: { text: string; startLine: number; endLine: number }) => {
+    if (!selectedFile || !nextSelection.text.trim()) return;
+    setIsLoadingHistory(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/workspaces/${workspace.id}/code-history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: selectedFile,
+          selectedText: nextSelection.text,
+          startLine: nextSelection.startLine,
+          endLine: nextSelection.endLine
+        })
+      });
+      if (!response.ok) throw new Error('Failed to load code history');
+      const payload = await response.json() as { entries: CodeHistoryEntry[] };
+      setHistory(payload.entries);
+      setError('');
+    } catch (historyError) {
+      setError(historyError instanceof Error ? historyError.message : 'Failed to load code history');
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
+  const handleCodeMouseUp = () => {
+    const browserSelection = window.getSelection();
+    const text = browserSelection?.toString() ?? '';
+    if (!text.trim()) return;
+
+    const anchorElement = browserSelection?.anchorNode?.parentElement?.closest('[data-line-number]') as HTMLElement | null;
+    const focusElement = browserSelection?.focusNode?.parentElement?.closest('[data-line-number]') as HTMLElement | null;
+    const anchorLine = Number(anchorElement?.dataset.lineNumber ?? 1);
+    const focusLine = Number(focusElement?.dataset.lineNumber ?? anchorLine);
+    const nextSelection = {
+      text,
+      startLine: Math.min(anchorLine, focusLine),
+      endLine: Math.max(anchorLine, focusLine)
+    };
+    setSelection(nextSelection);
+    queryHistory(nextSelection).catch(() => undefined);
+  };
+
+  const parentDir = currentDir.split('/').slice(0, -1).join('/');
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[100] bg-slate-950/85 p-6 backdrop-blur-sm"
+    >
+      <motion.div
+        initial={{ y: 16, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        className="flex h-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950 shadow-2xl"
+      >
+        <div className="flex w-72 shrink-0 flex-col border-r border-slate-800">
+          <div className="border-b border-slate-800 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="text-sm font-bold uppercase tracking-widest text-blue-400">代码故事线</h2>
+                <p className="mt-1 truncate text-[11px] text-slate-500">{workspace.name}</p>
+              </div>
+              <button onClick={onClose} className="rounded p-1.5 text-slate-500 hover:bg-slate-900 hover:text-slate-200" aria-label="Close">
+                <X size={16} />
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3">
+            {currentDir && (
+              <button
+                type="button"
+                onClick={() => setCurrentDir(parentDir)}
+                className="mb-2 w-full rounded border border-slate-800 bg-slate-900/50 px-3 py-2 text-left text-xs text-slate-400 hover:border-blue-500 hover:text-blue-300"
+              >
+                ../
+              </button>
+            )}
+            <div className="space-y-1">
+              {entries.map((entry) => (
+                <button
+                  key={entry.path}
+                  type="button"
+                  onClick={() => {
+                    if (entry.type === 'directory') setCurrentDir(entry.path);
+                    else openFile(entry.path).catch((openError) => setError(openError instanceof Error ? openError.message : 'Failed to open file'));
+                  }}
+                  className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                    selectedFile === entry.path ? 'bg-blue-500/15 text-blue-200' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+                  }`}
+                >
+                  {entry.type === 'directory' ? <FolderOpen size={13} /> : <FileTextIcon />}
+                  <span className="truncate">{entry.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex min-w-0 flex-1 flex-col border-r border-slate-800">
+          <div className="border-b border-slate-800 px-4 py-3">
+            <div className="truncate text-xs font-bold text-slate-300">{selectedFile || '选择一个文件后，拖选代码段查看故事线'}</div>
+            {selection && (
+              <div className="mt-1 text-[10px] font-bold uppercase tracking-widest text-blue-400">
+                Lines {selection.startLine}-{selection.endLine}
+              </div>
+            )}
+          </div>
+          <div className="flex-1 overflow-auto p-4" onMouseUp={handleCodeMouseUp}>
+            {selectedFile ? (
+              <pre className="select-text font-mono text-xs leading-relaxed text-slate-300">
+                {contentLines.map((line, index) => (
+                  <div key={index} data-line-number={index + 1} className="flex min-w-max hover:bg-slate-900/60">
+                    <span className="mr-4 w-10 shrink-0 select-none text-right text-slate-600">{index + 1}</span>
+                    <code className="whitespace-pre">{line || ' '}</code>
+                  </div>
+                ))}
+              </pre>
+            ) : (
+              <div className="flex h-full items-center justify-center text-xs font-bold uppercase tracking-widest text-slate-700">
+                Select file
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex w-96 shrink-0 flex-col">
+          <div className="border-b border-slate-800 p-4">
+            <div className="text-sm font-bold uppercase tracking-widest text-blue-400">修改故事线</div>
+            <p className="mt-1 text-[11px] text-slate-500">选择代码后显示涉及它的对话与时间</p>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4">
+            {error && <div className="mb-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
+            {isLoadingHistory ? (
+              <div className="py-10 text-center text-xs font-bold uppercase tracking-widest text-blue-400">Loading...</div>
+            ) : history.length === 0 ? (
+              <div className="py-10 text-center text-[11px] font-bold uppercase tracking-widest text-slate-600">
+                No story for current selection
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {history.map((entry) => (
+                  <div key={`${entry.turnId}-${entry.filePath}`} className="rounded border border-slate-800 bg-slate-900/40 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="truncate text-xs font-bold text-blue-300">{entry.taskTitle || 'Untitled task'}</span>
+                      <span className="shrink-0 text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                        {new Date(entry.createdAt).toLocaleString()}
+                      </span>
+                    </div>
+                    <p className="mb-2 line-clamp-2 text-xs text-slate-300">{entry.prompt}</p>
+                    <div className="mb-3 flex items-center gap-2 text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                      <span>{entry.sessionName}</span>
+                      <span>{entry.provider}</span>
+                      <span>{entry.changeKind}</span>
+                    </div>
+                    <pre className="max-h-32 overflow-auto rounded border border-red-500/20 bg-red-500/10 p-2 text-[10px] text-red-100">{entry.beforeExcerpt || '(empty before)'}</pre>
+                    <pre className="mt-2 max-h-32 overflow-auto rounded border border-green-500/20 bg-green-500/10 p-2 text-[10px] text-green-100">{entry.afterExcerpt || '(empty after)'}</pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const FileTextIcon = () => <span className="h-3 w-3 shrink-0 rounded-sm border border-slate-600" />;
+
 export default function App() {
   const [activeItem, setActiveItem] = useState<string | null>(null);
   const [selectedTurns, setSelectedTurns] = useState<string[]>([]);
@@ -2351,6 +2947,7 @@ export default function App() {
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
   const [isDeletingWorkspace, setIsDeletingWorkspace] = useState(false);
+  const [isCodeStoryOpen, setIsCodeStoryOpen] = useState(false);
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [sessionTurns, setSessionTurns] = useState<Record<string, Turn[]>>({});
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AgentRunStatus>>({});
@@ -2490,6 +3087,7 @@ export default function App() {
   };
 
   const activeSession = projects.flatMap(project => project.items).find(item => item.id === activeItem);
+  const activeProject = projects.find(project => project.items.some(item => item.id === activeItem));
   const pendingSessionProject = projects.find(project => project.id === pendingSessionProjectId);
   const pendingDeleteProject = projects.find(project => project.id === pendingDeleteProjectId);
 
@@ -2642,11 +3240,19 @@ export default function App() {
             )}
           </AnimatePresence>
         </main>
-        <RightPanel 
-          turns={sessionTurns[activeItem || ''] || []} 
+        <RightPanel
+          turns={sessionTurns[activeItem || ''] || []}
+          workspace={activeProject}
+          onOpenCodeStory={() => setIsCodeStoryOpen(true)}
         />
       </div>
       <AnimatePresence>
+        {isCodeStoryOpen && activeProject && (
+          <CodeStoryModal
+            workspace={activeProject}
+            onClose={() => setIsCodeStoryOpen(false)}
+          />
+        )}
         {isAddProjectOpen && (
           <AddProjectModal
             onClose={() => setIsAddProjectOpen(false)}
