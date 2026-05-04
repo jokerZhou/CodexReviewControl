@@ -45,6 +45,111 @@ const hasReviewSnapshot = (text: string | null | undefined) => text !== null && 
 
 type DiffOp = { kind: 'same' | 'add' | 'delete'; text: string };
 
+const buildCharDiffOps = (beforeText: string, afterText: string) => {
+  const beforeChars = Array.from(beforeText);
+  const afterChars = Array.from(afterText);
+  const table = Array.from({ length: beforeChars.length + 1 }, () => Array(afterChars.length + 1).fill(0));
+
+  for (let i = beforeChars.length - 1; i >= 0; i -= 1) {
+    for (let j = afterChars.length - 1; j >= 0; j -= 1) {
+      table[i][j] = beforeChars[i] === afterChars[j]
+        ? table[i + 1][j + 1] + 1
+        : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+
+  const ops: DiffOp[] = [];
+  const push = (kind: DiffOp['kind'], text: string) => {
+    const previous = ops[ops.length - 1];
+    if (previous?.kind === kind) {
+      previous.text += text;
+      return;
+    }
+    ops.push({ kind, text });
+  };
+
+  let i = 0;
+  let j = 0;
+
+  while (i < beforeChars.length && j < afterChars.length) {
+    if (beforeChars[i] === afterChars[j]) {
+      push('same', beforeChars[i]);
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    if (table[i + 1][j] >= table[i][j + 1]) {
+      push('delete', beforeChars[i]);
+      i += 1;
+    } else {
+      push('add', afterChars[j]);
+      j += 1;
+    }
+  }
+
+  while (i < beforeChars.length) {
+    push('delete', beforeChars[i]);
+    i += 1;
+  }
+
+  while (j < afterChars.length) {
+    push('add', afterChars[j]);
+    j += 1;
+  }
+
+  return ops;
+};
+
+const renderInlineCharDiff = (beforeText: string, afterText: string, side: 'before' | 'after') => {
+  const beforeChars = Array.from(beforeText);
+  const afterChars = Array.from(afterText);
+  let prefixLength = 0;
+
+  while (
+    prefixLength < beforeChars.length &&
+    prefixLength < afterChars.length &&
+    beforeChars[prefixLength] === afterChars[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < beforeChars.length - prefixLength &&
+    suffixLength < afterChars.length - prefixLength &&
+    beforeChars[beforeChars.length - 1 - suffixLength] === afterChars[afterChars.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  const chars = side === 'before' ? beforeChars : afterChars;
+  const middleStart = prefixLength;
+  const middleEnd = chars.length - suffixLength;
+  const segments = [
+    { text: chars.slice(0, middleStart).join(''), changed: false },
+    { text: chars.slice(middleStart, middleEnd).join(''), changed: middleEnd > middleStart },
+    { text: chars.slice(middleEnd).join(''), changed: false }
+  ].filter(segment => segment.text.length > 0);
+
+  return segments
+    .map((segment, index) => {
+      return (
+        <span
+          key={`${side}-${index}`}
+          className={segment.changed
+            ? side === 'before'
+              ? 'rounded-sm bg-red-500/45 px-0.5 text-red-50 line-through decoration-red-100/80'
+              : 'rounded-sm bg-green-400/35 px-0.5 text-green-50'
+            : 'text-slate-100/85'
+          }
+        >
+          {segment.text}
+        </span>
+      );
+    });
+};
+
 const buildLineDiffOps = (beforeText: string | null | undefined, afterText: string | null | undefined) => {
   const beforeLines = splitLines(beforeText);
   const afterLines = splitLines(afterText);
@@ -1255,8 +1360,14 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         <div className="flex items-center gap-3">
           <h1 className="text-2xl font-semibold font-display text-on-surface">{providerLabel} CLI</h1>
           <div className="flex gap-2">
-            <span className="px-2 py-1 bg-secondary/10 text-secondary text-[10px] font-bold border border-secondary/20 rounded">STATUS: READY</span>
-            <span className="px-2 py-1 bg-slate-800 text-slate-400 text-[10px] font-bold border border-slate-700 rounded">PID: 4892</span>
+            <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest rounded border ${
+              isRunning
+                ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+                : 'border-secondary/20 bg-secondary/10 text-secondary'
+            }`}>
+              STATUS: {isRunning ? 'BUSY' : 'READY'}
+            </span>
+            <span className="px-2 py-1 bg-slate-800 text-slate-400 text-[10px] font-bold border border-slate-700 rounded">SESSION: {sessionId.slice(-6)}</span>
           </div>
         </div>
         <div className="flex min-w-0 items-center gap-3">
@@ -1896,11 +2007,15 @@ const TurnDetailModal = ({ turn, turns, onClose }: { turn: Turn, turns?: Turn[],
                                   <span className="flex min-w-0 flex-1 flex-col gap-1 whitespace-pre-wrap">
                                     <span className="flex min-w-0 items-start gap-2 rounded border border-red-400/20 bg-red-500/10 px-2 py-1 text-red-100">
                                       <span className="shrink-0 select-none text-red-300">-</span>
-                                      <span className="min-w-0 flex-1 break-words line-through decoration-red-300/70">{row.beforeText || ' '}</span>
+                                      <span className="min-w-0 flex-1 break-words">
+                                        {renderInlineCharDiff(row.beforeText || ' ', row.text || ' ', 'before')}
+                                      </span>
                                     </span>
                                     <span className="flex min-w-0 items-start gap-2 rounded border border-green-400/20 bg-green-500/10 px-2 py-1 text-green-100">
                                       <span className="shrink-0 select-none text-green-300">+</span>
-                                      <span className="min-w-0 flex-1 break-words">{row.text || ' '}</span>
+                                      <span className="min-w-0 flex-1 break-words">
+                                        {renderInlineCharDiff(row.beforeText || ' ', row.text || ' ', 'after')}
+                                      </span>
                                     </span>
                                   </span>
                                 ) : (
