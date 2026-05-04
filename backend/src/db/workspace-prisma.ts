@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { prisma } from './prisma.js';
@@ -20,6 +20,27 @@ interface WorkspaceContext {
 const clients = new Map<string, WorkspacePrismaClient>();
 
 const sqliteUrl = (path: string) => pathToFileURL(path).toString();
+
+const ensureGitignoreEntry = async (workspacePath: string) => {
+  const gitignorePath = join(workspacePath, '.gitignore');
+  let content = '';
+
+  try {
+    content = await readFile(gitignorePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const hasReviewdockEntry = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .some((line) => line === '.reviewdock' || line === '.reviewdock/' || line === '/.reviewdock' || line === '/.reviewdock/');
+
+  if (hasReviewdockEntry) return;
+
+  const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+  await writeFile(gitignorePath, `${content}${separator}.reviewdock/\n`);
+};
 
 const createTables = async (db: WorkspacePrismaClient) => {
   await db.$executeRawUnsafe('PRAGMA foreign_keys = ON');
@@ -105,6 +126,7 @@ export const ensureReviewdock = async (workspacePath: string) => {
   const dir = reviewdockDir(workspacePath);
   await mkdir(dir, { recursive: true });
   await mkdir(workspaceUploadsDir(workspacePath), { recursive: true });
+  await ensureGitignoreEntry(workspacePath);
   await writeFile(join(dir, 'config.json'), `${JSON.stringify({ version: 1 }, null, 2)}\n`, { flag: 'wx' }).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== 'EEXIST') throw error;
   });
