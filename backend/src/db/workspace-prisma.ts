@@ -21,6 +21,12 @@ const clients = new Map<string, WorkspacePrismaClient>();
 
 const sqliteUrl = (path: string) => pathToFileURL(path).toString();
 
+const addColumnIfMissing = async (db: WorkspacePrismaClient, table: string, column: string, definition: string) => {
+  const columns = await db.$queryRawUnsafe<Array<{ name: string }>>(`PRAGMA table_info("${table}")`);
+  if (columns.some((item) => item.name === column)) return;
+  await db.$executeRawUnsafe(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`);
+};
+
 const ensureGitignoreEntry = async (workspacePath: string) => {
   const gitignorePath = join(workspacePath, '.gitignore');
   let content = '';
@@ -75,9 +81,12 @@ const createTables = async (db: WorkspacePrismaClient) => {
       "assistantContent" TEXT,
       "sessionId" TEXT NOT NULL,
       "userMessageId" TEXT,
+      "researchPlanId" TEXT,
+      "plannedFilesJson" TEXT,
       "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       "completedAt" DATETIME,
-      CONSTRAINT "Turn_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+      CONSTRAINT "Turn_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT "Turn_researchPlanId_fkey" FOREIGN KEY ("researchPlanId") REFERENCES "ResearchPlan" ("id") ON DELETE SET NULL ON UPDATE CASCADE
     )
   `);
   await db.$executeRawUnsafe(`
@@ -88,9 +97,23 @@ const createTables = async (db: WorkspacePrismaClient) => {
       "beforeContent" TEXT,
       "afterContent" TEXT,
       "content" TEXT,
+      "scopeStatus" TEXT,
       "turnId" TEXT NOT NULL,
       "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT "ModifiedFile_turnId_fkey" FOREIGN KEY ("turnId") REFERENCES "Turn" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    )
+  `);
+  await db.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "ResearchPlan" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "sessionId" TEXT NOT NULL,
+      "messageId" TEXT NOT NULL,
+      "prompt" TEXT NOT NULL,
+      "summary" TEXT NOT NULL,
+      "plannedFilesJson" TEXT NOT NULL,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "ResearchPlan_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT "ResearchPlan_messageId_fkey" FOREIGN KEY ("messageId") REFERENCES "Message" ("id") ON DELETE CASCADE ON UPDATE CASCADE
     )
   `);
   await db.$executeRawUnsafe(`
@@ -114,12 +137,20 @@ const createTables = async (db: WorkspacePrismaClient) => {
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Message_sessionId_idx" ON "Message"("sessionId")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Message_createdAt_idx" ON "Message"("createdAt")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Turn_sessionId_idx" ON "Turn"("sessionId")');
+  await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Turn_researchPlanId_idx" ON "Turn"("researchPlanId")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Turn_createdAt_idx" ON "Turn"("createdAt")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ModifiedFile_turnId_idx" ON "ModifiedFile"("turnId")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ModifiedFile_path_idx" ON "ModifiedFile"("path")');
+  await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ResearchPlan_sessionId_idx" ON "ResearchPlan"("sessionId")');
+  await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ResearchPlan_createdAt_idx" ON "ResearchPlan"("createdAt")');
+  await db.$executeRawUnsafe('CREATE UNIQUE INDEX IF NOT EXISTS "ResearchPlan_messageId_key" ON "ResearchPlan"("messageId")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ReviewChangeNote_turnId_idx" ON "ReviewChangeNote"("turnId")');
   await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "ReviewChangeNote_filePath_idx" ON "ReviewChangeNote"("filePath")');
   await db.$executeRawUnsafe('CREATE UNIQUE INDEX IF NOT EXISTS "ReviewChangeNote_turnId_filePath_groupId_key" ON "ReviewChangeNote"("turnId", "filePath", "groupId")');
+
+  await addColumnIfMissing(db, 'Turn', 'researchPlanId', 'TEXT');
+  await addColumnIfMissing(db, 'Turn', 'plannedFilesJson', 'TEXT');
+  await addColumnIfMissing(db, 'ModifiedFile', 'scopeStatus', 'TEXT');
 };
 
 export const ensureReviewdock = async (workspacePath: string) => {

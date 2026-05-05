@@ -45,6 +45,55 @@ const reviewPaneText = (text: string | null | undefined, emptyLabel: string) => 
 const hasReviewSnapshot = (text: string | null | undefined) => text !== null && text !== undefined && text.length > 0;
 
 type DiffOp = { kind: 'same' | 'add' | 'delete'; text: string };
+type TerminalHistoryLine = {
+  type: string;
+  text: string;
+  prompt?: boolean;
+  color?: string;
+  collapsible?: boolean;
+  summary?: string;
+};
+
+const buildTerminalHistoryLine = (text: string, color?: string, type = 'info'): TerminalHistoryLine => {
+  const normalized = text.replace(/\r\n/g, '\n').trimEnd();
+  if (!normalized.startsWith('$ ')) return { type, text, color };
+
+  const lines = normalized.split('\n');
+  if (lines.length <= 1) return { type, text: normalized, color };
+
+  return {
+    type,
+    text: normalized,
+    color,
+    collapsible: true,
+    summary: lines[0]
+  };
+};
+
+const buildTerminalHistoryLines = (text: string, color?: string, type = 'info'): TerminalHistoryLine[] => {
+  const normalized = text.replace(/\r\n/g, '\n').trimEnd();
+  if (!normalized.includes('\n$ ')) return [buildTerminalHistoryLine(normalized, color, type)];
+
+  const blocks: string[] = [];
+  const lines = normalized.split('\n');
+  let current: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith('$ ') && current.length > 0) {
+      blocks.push(current.join('\n'));
+      current = [line];
+      continue;
+    }
+    current.push(line);
+  }
+
+  if (current.length > 0) blocks.push(current.join('\n'));
+  const parsed = blocks.filter(Boolean).map((block) => buildTerminalHistoryLine(block, color, type));
+  return parsed.filter((line, index) => {
+    const next = parsed[index + 1];
+    return !(line.text.startsWith('$ ') && !line.collapsible && next?.collapsible && next.summary === line.text);
+  });
+};
 
 const buildCharDiffOps = (beforeText: string, afterText: string) => {
   const beforeChars = Array.from(beforeText);
@@ -436,6 +485,7 @@ interface ModifiedFile {
   name: string;
   status: 'M' | 'A' | 'D';
   statusColor: string;
+  scopeStatus?: 'planned' | 'extra' | null;
   reason?: string;
   remarks?: string;
   diffSnippet?: string;
@@ -535,6 +585,25 @@ interface ApiModifiedFile {
   content?: string | null;
   beforeContent?: string | null;
   afterContent?: string | null;
+  scopeStatus?: 'planned' | 'extra' | null;
+}
+
+interface ResearchPlannedFile {
+  path: string;
+  action: 'add' | 'delete' | 'update';
+  reason: string;
+}
+
+interface ResearchPlanResponse {
+  researchPlan: {
+    id: string;
+    prompt: string;
+    summary: string;
+    confidence: 'low' | 'medium' | 'high';
+    files: ResearchPlannedFile[];
+    risks: string[];
+    message: ApiMessage;
+  };
 }
 
 interface ApiReviewChangeNote {
@@ -809,6 +878,33 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
         </div>
       </motion.div>
     </motion.div>
+  );
+};
+
+const TerminalHistoryItem = ({ line }: { line: TerminalHistoryLine }) => {
+  const [expanded, setExpanded] = useState(false);
+  const displayText = line.collapsible && !expanded ? (line.summary || line.text) : line.text;
+
+  if (line.collapsible) {
+    return (
+      <button
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        className={`flex w-full items-start gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-slate-900/70 ${line.color || ''}`}
+        title={expanded ? '点击收起命令输出' : '点击查看命令输出'}
+      >
+        {line.prompt && <span className="shrink-0 font-bold text-blue-400">➜</span>}
+        <span className="shrink-0 text-slate-600">{expanded ? '▾' : '▸'}</span>
+        <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{displayText}</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className={`flex items-start gap-2 ${line.color || ''}`}>
+      {line.prompt && <span className="shrink-0 font-bold text-blue-400">➜</span>}
+      <span className="whitespace-pre-wrap break-words">{displayText}</span>
+    </div>
   );
 };
 
@@ -1144,6 +1240,8 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const [codexOptions, setCodexOptions] = useState<CodexOptionsResponse>(fallbackCodexOptions);
   const [codexModel, setCodexModel] = useState(fallbackCodexOptions.defaults.model);
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffort>(fallbackCodexOptions.defaults.reasoningEffort);
+  const [researchConfirmEnabled, setResearchConfirmEnabled] = useState(false);
+  const [pendingResearch, setPendingResearch] = useState<ResearchPlanResponse['researchPlan'] | null>(null);
   const providerLabel = providerMeta[provider].label;
   const isCodexCli = provider === 'codex-cli';
   const [history, setHistory] = useState([
@@ -1198,12 +1296,16 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         onMessagesLoaded(sessionId, data.messages, data.turns || []);
         setHistory(prev => [
           ...prev,
-          ...data.messages.map((message) => ({
-            type: message.role === 'user' ? 'cmd' : 'info',
-            text: message.content,
-            prompt: message.role === 'user',
-            color: message.role === 'assistant' ? 'text-slate-300' : undefined
-          }))
+          ...data.messages.flatMap((message) => (
+            message.role === 'assistant'
+              ? buildTerminalHistoryLines(message.content, 'text-slate-300', 'info')
+              : [{
+                  type: message.role === 'user' ? 'cmd' : 'info',
+                  text: message.content,
+                  prompt: message.role === 'user',
+                  color: undefined
+                }]
+          ))
         ]);
       })
       .catch((error) => {
@@ -1277,6 +1379,12 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
 
     setInput('');
     const filesToSend = attachments.map(attachment => attachment.file);
+    if (researchConfirmEnabled && provider === 'codex' && filesToSend.length > 0) {
+      setHistory(prev => [...prev, { type: 'error', text: '调研确认暂不支持图片附件，请先关闭调研确认或移除图片。', color: 'text-error' }]);
+      setIsRunning(false);
+      onRunStatusChange(sessionId, 'idle');
+      return;
+    }
     attachments.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl));
     setAttachments([]);
     setIsRunning(true);
@@ -1284,6 +1392,45 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     onRunCommand(prompt);
 
     try {
+      if (researchConfirmEnabled && provider === 'codex') {
+        setHistory(prev => [...prev, {
+          type: 'info',
+          text: `Codex 正在调研本次任务预计涉及的文件...`,
+          color: 'text-amber-300'
+        }]);
+        const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/research`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            model: codexModel,
+            reasoningEffort: codexReasoningEffort
+          })
+        });
+
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(payload.error || 'Codex 调研失败');
+        }
+
+        const payload = await response.json() as ResearchPlanResponse;
+        setPendingResearch(payload.researchPlan);
+        const files = payload.researchPlan.files.length > 0
+          ? payload.researchPlan.files.map((file) => `${file.action} ${file.path}: ${file.reason}`).join('\n')
+          : '未明确预计文件';
+        const risks = payload.researchPlan.risks.length > 0 ? `\n风险/不确定性:\n${payload.researchPlan.risks.join('\n')}` : '';
+        setHistory(prev => [...prev, {
+          type: 'research',
+          text: `Codex 调研完成\n${payload.researchPlan.summary}\n置信度: ${payload.researchPlan.confidence}\n\n预计文件:\n${files}${risks}`,
+          color: 'text-amber-200'
+        }]);
+        fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
+          .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to reload research message')))
+          .then((payload: { messages: ApiMessage[], turns: ApiTurn[] }) => onMessagesLoaded(sessionId, payload.messages, payload.turns || []))
+          .catch(() => undefined);
+        return;
+      }
+
       const isCodexProvider = provider === 'codex' || provider === 'codex-cli';
       const body = isCodexProvider && filesToSend.length > 0
         ? (() => {
@@ -1331,7 +1478,11 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
           setHistory(prev => [...prev, { type: 'info', text: `Task: ${data.title}`, color: 'text-blue-400' }]);
         }
         if (event === 'chunk') {
-          setHistory(prev => [...prev, { type: data.stream === 'stderr' ? 'error' : 'info', text: data.text, color: data.stream === 'stderr' ? 'text-error' : 'text-slate-300' }]);
+          setHistory(prev => [...prev, buildTerminalHistoryLine(
+            data.text,
+            data.stream === 'stderr' ? 'text-error' : 'text-slate-300',
+            data.stream === 'stderr' ? 'error' : 'info'
+          )]);
         }
         if (event === 'file_change') {
           setHistory(prev => [...prev, { type: 'info', text: `Files changed: ${data.changes.map((change: { kind: string, path: string }) => `${change.kind} ${change.path}`).join(', ')}`, color: 'text-blue-400' }]);
@@ -1362,6 +1513,85 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         text: error instanceof Error ? error.message : 'Agent run failed',
         color: 'text-error'
       }]);
+    } finally {
+      setIsRunning(false);
+      onRunStatusChange(sessionId, 'idle');
+    }
+  };
+
+  const runConfirmedResearch = async () => {
+    if (!pendingResearch || isRunning) return;
+    const research = pendingResearch;
+    setPendingResearch(null);
+    setIsRunning(true);
+    onRunStatusChange(sessionId, 'busy');
+    onRunCommand(research.prompt);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/turns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: research.prompt,
+          model: codexModel,
+          reasoningEffort: codexReasoningEffort,
+          researchPlanId: research.id
+        })
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Failed to run ${providerLabel} session`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const handleSseBlock = (block: string) => {
+        const event = block.split('\n').find(line => line.startsWith('event: '))?.slice(7);
+        const dataLine = block.split('\n').find(line => line.startsWith('data: '));
+        if (!event || !dataLine) return;
+        const data = JSON.parse(dataLine.slice(6));
+        if (event === 'status') {
+          setHistory(prev => [...prev, { type: 'info', text: `[${data.status}] ${providerLabel}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
+        }
+        if (event === 'task_title') {
+          onTaskTitle(data.title, sessionId);
+          setHistory(prev => [...prev, { type: 'info', text: `Task: ${data.title}`, color: 'text-blue-400' }]);
+        }
+        if (event === 'research_confirmed') {
+          setHistory(prev => [...prev, { type: 'info', text: `Research confirmed: ${data.plannedFiles.length} planned files`, color: 'text-amber-300' }]);
+        }
+        if (event === 'chunk') {
+          setHistory(prev => [...prev, buildTerminalHistoryLine(
+            data.text,
+            data.stream === 'stderr' ? 'text-error' : 'text-slate-300',
+            data.stream === 'stderr' ? 'error' : 'info'
+          )]);
+        }
+        if (event === 'file_change') {
+          setHistory(prev => [...prev, { type: 'info', text: `Files changed: ${data.changes.map((change: { kind: string, path: string }) => `${change.kind} ${change.path}`).join(', ')}`, color: 'text-blue-400' }]);
+        }
+        if (event === 'error') {
+          setHistory(prev => [...prev, { type: 'error', text: data.message, color: 'text-error' }]);
+        }
+        if (event === 'done') {
+          fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
+            .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to reload turn details')))
+            .then((payload: { messages: ApiMessage[], turns: ApiTurn[] }) => onMessagesLoaded(sessionId, payload.messages, payload.turns || []))
+            .catch(() => undefined);
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split('\n\n');
+        buffer = blocks.pop() || '';
+        blocks.forEach(handleSseBlock);
+      }
+    } catch (error) {
+      setHistory(prev => [...prev, { type: 'error', text: error instanceof Error ? error.message : 'Agent run failed', color: 'text-error' }]);
     } finally {
       setIsRunning(false);
       onRunStatusChange(sessionId, 'idle');
@@ -1455,11 +1685,44 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         >
           <div className="space-y-1">
             {history.map((line, i) => (
-              <div key={i} className={`flex items-start gap-2 ${line.color || ''}`}>
-                {line.prompt && <span className="text-blue-400 font-bold shrink-0">➜</span>}
-                <span className="whitespace-pre-wrap">{line.text}</span>
-              </div>
+              <TerminalHistoryItem key={i} line={line} />
             ))}
+            {pendingResearch && (
+              <div className="mt-3 rounded border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100">
+                <div className="mb-2 font-bold uppercase tracking-widest text-amber-200">等待确认执行</div>
+                <div className="mb-2 text-slate-200">{pendingResearch.summary}</div>
+                <div className="max-h-36 overflow-y-auto rounded border border-amber-400/20 bg-slate-950/60 p-2 font-mono text-[11px] hide-scrollbar">
+                  {pendingResearch.files.length === 0 ? (
+                    <div className="text-amber-300">未明确预计文件</div>
+                  ) : (
+                    pendingResearch.files.map((file) => (
+                      <div key={`${pendingResearch.id}:${file.path}`} className="mb-1">
+                        <span className="text-amber-300">{file.action}</span> <span className="text-slate-200">{file.path}</span>
+                        <span className="text-slate-500"> - {file.reason}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <button
+                    type="button"
+                    disabled={isRunning}
+                    onClick={runConfirmedResearch}
+                    className="rounded bg-amber-400 px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-950 disabled:opacity-50"
+                  >
+                    确认执行
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isRunning}
+                    onClick={() => setPendingResearch(null)}
+                    className="rounded border border-slate-700 px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-400 hover:text-slate-200 disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
             {isCodexCli && (
               <form onSubmit={handleCommand} className="flex items-center gap-2 pt-1">
                 <span className="text-blue-400 font-bold shrink-0">➜</span>
@@ -1511,6 +1774,21 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
             <form onSubmit={handleCommand} className="flex items-center gap-2 px-4 py-3 font-mono text-sm">
               <span className="text-blue-400 font-bold">➜</span>
               <span className="text-slate-500 font-bold select-none whitespace-nowrap">nexus-gateway</span>
+              {provider === 'codex' && (
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => setResearchConfirmEnabled((current) => !current)}
+                  className={`shrink-0 rounded border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                    researchConfirmEnabled
+                      ? 'border-amber-400/50 bg-amber-400/10 text-amber-200'
+                      : 'border-slate-800 bg-slate-900 text-slate-500 hover:border-blue-500 hover:text-blue-300'
+                  }`}
+                  title="开启后先让 Codex 只做调研，确认后再执行"
+                >
+                  调研确认：{researchConfirmEnabled ? '开' : '关'}
+                </button>
+              )}
               <input
                 autoFocus
                 disabled={isRunning}
@@ -1681,6 +1959,7 @@ const TurnDetailModal = ({ turn, turns, workspace, onClose }: { turn: Turn, turn
             name: file.path,
             status: file.kind === 'add' ? 'A' : file.kind === 'delete' ? 'D' : 'M',
             statusColor: file.kind === 'add' ? 'text-blue-400' : file.kind === 'delete' ? 'text-error' : 'text-secondary',
+            scopeStatus: file.scopeStatus,
             content: file.content,
             beforeContent: file.beforeContent || null,
             afterContent: file.afterContent || file.content || null,
@@ -2087,6 +2366,15 @@ const TurnDetailModal = ({ turn, turns, workspace, onClose }: { turn: Turn, turn
                             <div className="flex items-center gap-2">
                               <span className={`text-xs font-mono font-bold ${file.statusColor}`}>{file.status}</span>
                               <span className="truncate text-[11px] font-mono text-slate-300">{file.name}</span>
+                              {file.scopeStatus && (
+                                <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest ${
+                                  file.scopeStatus === 'extra'
+                                    ? 'border-amber-400/40 bg-amber-400/10 text-amber-200'
+                                    : 'border-blue-400/30 bg-blue-400/10 text-blue-200'
+                                }`}>
+                                  {file.scopeStatus === 'extra' ? '额外修改' : '计划内'}
+                                </span>
+                              )}
                             </div>
                           </button>
                         ))
@@ -2102,6 +2390,15 @@ const TurnDetailModal = ({ turn, turns, workspace, onClose }: { turn: Turn, turn
                     <div className="flex min-w-0 items-center gap-3">
                       <span className={`text-xs font-mono font-bold ${selectedFile?.statusColor}`}>{selectedFile?.status}</span>
                       <span className="truncate text-xs font-mono text-slate-300">{selectedFile?.name}</span>
+                      {selectedFile?.scopeStatus && (
+                        <span className={`rounded border px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${
+                          selectedFile.scopeStatus === 'extra'
+                            ? 'border-amber-400/40 bg-amber-400/10 text-amber-200'
+                            : 'border-blue-400/30 bg-blue-400/10 text-blue-200'
+                        }`}>
+                          {selectedFile.scopeStatus === 'extra' ? '额外修改' : '计划内'}
+                        </span>
+                      )}
                     </div>
                     <div className="flex shrink-0 overflow-hidden rounded border border-slate-800 bg-slate-950 p-0.5">
                       <button
@@ -3177,6 +3474,7 @@ export default function App() {
               name: file.path,
               status: file.kind === 'add' ? 'A' : file.kind === 'delete' ? 'D' : 'M',
               statusColor: file.kind === 'add' ? 'text-blue-400' : file.kind === 'delete' ? 'text-error' : 'text-secondary',
+              scopeStatus: file.scopeStatus,
               content: file.content,
               beforeContent: file.beforeContent || null,
               afterContent: file.afterContent || file.content || null,

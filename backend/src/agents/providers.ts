@@ -26,6 +26,19 @@ export interface AgentExplanationResult {
   externalSessionId?: string;
 }
 
+export interface ResearchPlannedFile {
+  path: string;
+  action: 'add' | 'delete' | 'update';
+  reason: string;
+}
+
+export interface ResearchPlanResult {
+  summary: string;
+  files: ResearchPlannedFile[];
+  confidence: 'low' | 'medium' | 'high';
+  risks: string[];
+}
+
 const codex = new Codex({
   env: process.env as Record<string, string>
 });
@@ -47,6 +60,7 @@ const formatCodexEvent = (event: ThreadEvent) => {
       if (event.item.type === 'agent_message') return event.item.text;
       if (event.item.type === 'reasoning') return event.item.text;
       if (event.item.type === 'command_execution') {
+        if (event.type !== 'item.completed' || !event.item.aggregated_output.trim()) return undefined;
         return `$ ${event.item.command}\n${event.item.aggregated_output}`;
       }
       if (event.item.type === 'file_change') {
@@ -124,6 +138,103 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
 
   yield { type: 'done', exitCode: 0 };
 }
+
+const researchPlanSchema = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
+    files: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          action: { type: 'string', enum: ['add', 'delete', 'update'] },
+          reason: { type: 'string' }
+        },
+        required: ['path', 'action', 'reason'],
+        additionalProperties: false
+      }
+    },
+    risks: {
+      type: 'array',
+      items: { type: 'string' }
+    }
+  },
+  required: ['summary', 'confidence', 'files', 'risks'],
+  additionalProperties: false
+} as const;
+
+const parseResearchPlan = (raw: string): ResearchPlanResult => {
+  const parsed = JSON.parse(raw) as Partial<ResearchPlanResult>;
+  const files = Array.isArray(parsed.files)
+    ? parsed.files
+      .filter((file): file is ResearchPlannedFile => (
+        !!file &&
+        typeof file.path === 'string' &&
+        (file.action === 'add' || file.action === 'delete' || file.action === 'update') &&
+        typeof file.reason === 'string'
+      ))
+      .map((file) => ({
+        path: file.path.replace(/\\/g, '/').replace(/^\/+/, '').trim(),
+        action: file.action,
+        reason: file.reason.trim() || 'Codex 预计该文件与本次任务相关。'
+      }))
+      .filter((file) => file.path && !file.path.includes('..'))
+    : [];
+
+  return {
+    summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary.trim() : 'Codex 已完成本次修改调研。',
+    confidence: parsed.confidence === 'high' || parsed.confidence === 'medium' || parsed.confidence === 'low' ? parsed.confidence : 'low',
+    files: [...new Map(files.map((file) => [file.path, file])).values()],
+    risks: Array.isArray(parsed.risks)
+      ? parsed.risks.filter((risk): risk is string => typeof risk === 'string').map((risk) => risk.trim()).filter(Boolean)
+      : []
+  };
+};
+
+export const runCodexResearchPlan = async (workspacePath: string, prompt: string, knownFiles: string[], options: CodexRunOptions): Promise<ResearchPlanResult> => {
+  const thread = codex.startThread({
+    model: options.model,
+    modelReasoningEffort: options.modelReasoningEffort === 'minimal' || options.modelReasoningEffort === 'low' || options.modelReasoningEffort === 'medium'
+      ? 'high'
+      : options.modelReasoningEffort,
+    workingDirectory: workspacePath,
+    skipGitRepoCheck: true,
+    sandboxMode: 'read-only',
+    approvalPolicy: 'never'
+  });
+
+  const researchPrompt = [
+    '你是 Codex 的执行前代码调研器。你的目标是尽量准确预测：如果稍后真正执行用户需求，哪些文件会被新增、删除或修改。',
+    '严格要求：',
+    '- 只做调研，绝对不要修改文件。',
+    '- 可以执行只读命令，例如 pwd、ls、find、rg、sed、cat、git status、git diff --name-only。',
+    '- 不要执行任何会改变工作区、安装依赖、格式化、生成代码、写文件、删除文件的命令。',
+    '- 在输出 JSON 前，必须先用只读命令实际检查代码结构，而不是只根据文件名列表猜测。',
+    '- 必须定位和用户需求相关的入口文件、组件/模块定义、调用方、路由/状态/样式/类型/测试/配置等可能联动的文件。',
+    '- 如果需求涉及 UI 交互，必须检查组件定义、使用处、状态流和样式文件。',
+    '- 如果需求涉及后端/API/数据库，必须检查路由、服务、schema/model、调用方和类型定义。',
+    '- 如果某文件只是被读取但不需要修改，不要列入 files。',
+    '- 对需要新增的文件，给出预计相对路径；对不确定路径，在 risks 里说明，不要乱列。',
+    '- 只返回 JSON，必须符合 schema。',
+    '- files 只列预计会被新增、删除或修改的文件，路径必须相对 workspace 根目录。',
+    '- 宁可少列不确定文件，也不要把明显无关的文件列进去；但必须覆盖完成任务通常必改的核心文件。',
+    '- 如果无法判断具体文件，files 返回空数组，并在 risks 中说明还需要先读哪些代码。',
+    '- reason 用中文说明为什么预计会改这个文件。',
+    '- summary 用中文说明你基于哪些代码位置做出判断。',
+    '',
+    '当前 workspace 可见文件列表：',
+    knownFiles.slice(0, 2000).join('\n') || '(没有可见文件)',
+    '',
+    '用户需求：',
+    prompt
+  ].join('\n');
+
+  const turn = await thread.run(researchPrompt, { outputSchema: researchPlanSchema });
+  return parseResearchPlan(turn.finalResponse);
+};
 
 async function* runCursorCliTurn(workspacePath: string, prompt: string): AsyncGenerator<AgentChunk> {
   const child = spawn('cursor-agent', ['-p', '--output-format', 'stream-json', prompt], {

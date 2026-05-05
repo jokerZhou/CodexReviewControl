@@ -6,7 +6,7 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
-import { runAgentExplanation, runAgentTurn, type AgentAttachment, type CodexRunOptions } from '../agents/providers.js';
+import { runAgentExplanation, runAgentTurn, runCodexResearchPlan, type AgentAttachment, type CodexRunOptions, type ResearchPlanResult } from '../agents/providers.js';
 import { findSessionContext, findTurnContext, workspaceUploadsDir } from '../db/workspace-prisma.js';
 import { resolveCodexRunOptions } from '../services/codex-options.js';
 import { extractTaskTitle } from '../services/task-title.js';
@@ -20,6 +20,13 @@ const turnParamsSchema = z.object({
 });
 
 const sendMessageSchema = z.object({
+  prompt: z.string().trim().min(1),
+  model: z.string().optional(),
+  reasoningEffort: z.string().optional(),
+  researchPlanId: z.string().optional()
+});
+
+const researchSchema = z.object({
   prompt: z.string().trim().min(1),
   model: z.string().optional(),
   reasoningEffort: z.string().optional()
@@ -108,6 +115,37 @@ const normalizeWorkspaceFilePath = (workspacePath: string, filePath: string) => 
   const resolvedPath = resolveWorkspaceFilePath(workspacePath, filePath);
   if (!resolvedPath) return filePath;
   return relative(resolve(workspacePath), resolvedPath);
+};
+
+const formatResearchMessage = (plan: ResearchPlanResult) => {
+  const files = plan.files.length > 0
+    ? plan.files.map((file) => `- ${file.action} ${file.path}: ${file.reason}`).join('\n')
+    : '- 未能明确判断具体文件';
+  const risks = plan.risks.length > 0 ? `\n风险/不确定性：\n${plan.risks.map((risk) => `- ${risk}`).join('\n')}` : '';
+
+  return [
+    '[Codex 调研结果]',
+    `结论：${plan.summary}`,
+    `置信度：${plan.confidence}`,
+    '',
+    '预计文件增删改：',
+    files,
+    risks
+  ].join('\n');
+};
+
+const plannedFilePathsFromJson = (raw: string | null | undefined) => {
+  if (!raw) return new Set<string>();
+  try {
+    const files = JSON.parse(raw) as Array<{ path?: unknown }>;
+    return new Set(
+      Array.isArray(files)
+        ? files.map((file) => typeof file.path === 'string' ? file.path : '').filter(Boolean)
+        : []
+    );
+  } catch {
+    return new Set<string>();
+  }
 };
 
 const shouldSnapshotFile = async (filePath: string) => {
@@ -201,6 +239,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
       success: true as const,
       prompt: body.data.prompt,
       options,
+      researchPlanId: body.data.researchPlanId,
       attachments: [] as AgentAttachment[]
     };
   }
@@ -211,6 +250,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
   let prompt = '';
   let model: string | undefined;
   let reasoningEffort: string | undefined;
+  let researchPlanId: string | undefined;
   const attachments: AgentAttachment[] = [];
 
   for await (const part of request.parts()) {
@@ -223,6 +263,9 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
       }
       if (part.fieldname === 'reasoningEffort' && typeof part.value === 'string') {
         reasoningEffort = part.value;
+      }
+      if (part.fieldname === 'researchPlanId' && typeof part.value === 'string') {
+        researchPlanId = part.value;
       }
       continue;
     }
@@ -248,7 +291,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
     attachments.push({ type: 'local_image', path: filePath });
   }
 
-  const body = sendMessageSchema.safeParse({ prompt, model, reasoningEffort });
+  const body = sendMessageSchema.safeParse({ prompt, model, reasoningEffort, researchPlanId });
   if (!body.success) {
     return { success: false as const, issues: body.error.issues };
   }
@@ -259,6 +302,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
     success: true as const,
     prompt: body.data.prompt,
     options,
+    researchPlanId: body.data.researchPlanId,
     attachments
   };
 };
@@ -297,6 +341,75 @@ const buildChangeExplanationPrompt = (turn: { prompt: string; taskTitle: string 
 };
 
 export async function registerSessionRoutes(app: FastifyInstance) {
+  app.post('/sessions/:sessionId/research', async (request, reply) => {
+    const params = sessionParamsSchema.safeParse(request.params);
+    const body = researchSchema.safeParse(request.body);
+
+    if (!params.success || !body.success) {
+      return reply.code(400).send({
+        error: 'Invalid research payload',
+        issues: [...(params.success ? [] : params.error.issues), ...(body.success ? [] : body.error.issues)]
+      });
+    }
+
+    const context = await findSessionContext(params.data.sessionId);
+    const session = context?.session;
+
+    if (!session) {
+      return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    if (session.provider !== AgentProvider.CODEX) {
+      return reply.code(400).send({ error: 'Research confirmation is only available for Codex SDK sessions.' });
+    }
+
+    const options = await resolveCodexRunOptions(body.data.model, body.data.reasoningEffort);
+    const beforeSnapshot = await snapshotWorkspace(context.workspace.path);
+
+    try {
+      const plan = await runCodexResearchPlan(
+        context.workspace.path,
+        body.data.prompt,
+        [...beforeSnapshot.keys()].sort(),
+        options
+      );
+      const content = formatResearchMessage(plan);
+      const message = await context.db.message.create({
+        data: {
+          sessionId: session.id,
+          role: 'system',
+          content,
+          taskTitle: 'Codex 调研'
+        }
+      });
+      const researchPlan = await context.db.researchPlan.create({
+        data: {
+          sessionId: session.id,
+          messageId: message.id,
+          prompt: body.data.prompt,
+          summary: plan.summary,
+          plannedFilesJson: JSON.stringify(plan.files)
+        }
+      });
+
+      return {
+        researchPlan: {
+          id: researchPlan.id,
+          prompt: researchPlan.prompt,
+          summary: researchPlan.summary,
+          confidence: plan.confidence,
+          files: plan.files,
+          risks: plan.risks,
+          message
+        }
+      };
+    } catch (error) {
+      request.log.error({ err: error, sessionId: session.id }, 'Codex research failed');
+      const message = error instanceof Error ? error.message : 'Codex research failed';
+      return reply.code(502).send({ error: message });
+    }
+  });
+
   app.get('/turns/:turnId', async (request, reply) => {
     const params = turnParamsSchema.safeParse(request.params);
     if (!params.success) {
@@ -314,6 +427,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       include: {
         modifiedFiles: { orderBy: { createdAt: 'asc' } },
         reviewNotes: { orderBy: { updatedAt: 'asc' } },
+        researchPlan: true,
         session: true
       }
     });
@@ -343,6 +457,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       ...turn,
       modifiedFiles: hydratedFiles,
       reviewNotes: turn.reviewNotes,
+      researchPlan: turn.researchPlan,
       session: undefined
     };
   });
@@ -487,7 +602,8 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         turns: {
           orderBy: { createdAt: 'asc' },
           include: {
-            modifiedFiles: { orderBy: { createdAt: 'asc' } }
+            modifiedFiles: { orderBy: { createdAt: 'asc' } },
+            researchPlan: true
           }
         }
       }
@@ -547,6 +663,15 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     reply.hijack();
 
     const taskTitle = await extractTaskTitle(body.prompt);
+    const researchPlan = body.researchPlanId
+      ? await context.db.researchPlan.findFirst({
+          where: {
+            id: body.researchPlanId,
+            sessionId: session.id
+          }
+        })
+      : null;
+    const plannedFilePaths = plannedFilePathsFromJson(researchPlan?.plannedFilesJson);
 
     const userMessage = await context.db.message.create({
       data: {
@@ -561,7 +686,9 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         sessionId: session.id,
         userMessageId: userMessage.id,
         prompt: body.prompt,
-        taskTitle
+        taskTitle,
+        researchPlanId: researchPlan?.id,
+        plannedFilesJson: researchPlan?.plannedFilesJson
       }
     });
 
@@ -590,6 +717,12 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     }
 
     const beforeSnapshot = await snapshotWorkspace(context.workspace.path);
+    if (researchPlan) {
+      writeSse(reply.raw, 'research_confirmed', {
+        researchPlanId: researchPlan.id,
+        plannedFiles: [...plannedFilePaths]
+      });
+    }
     let assistantContent = '';
     const modifiedFiles = new Map<string, { path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }>();
 
@@ -663,7 +796,8 @@ export async function registerSessionRoutes(app: FastifyInstance) {
               kind: file.kind,
               content: file.content,
               beforeContent: file.beforeContent,
-              afterContent: file.afterContent
+              afterContent: file.afterContent,
+              scopeStatus: researchPlan ? (plannedFilePaths.has(file.path) ? 'planned' : 'extra') : null
             }))
           }
         }
