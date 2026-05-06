@@ -43,6 +43,17 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000
 const API_WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
 console.log('[ReviewDock jump] diagnostics enabled');
 
+const formatRunDuration = (ms: number) => {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+};
+
 const splitLines = (text: string | null | undefined) => (text || '').replace(/\r\n/g, '\n').split('\n');
 const reviewPaneText = (text: string | null | undefined, emptyLabel: string) => text && text.length > 0 ? text : emptyLabel;
 const hasReviewSnapshot = (text: string | null | undefined) => text !== null && text !== undefined && text.length > 0;
@@ -58,6 +69,10 @@ type TerminalHistoryLine = {
   collapsible?: boolean;
   summary?: string;
 };
+
+const TERMINAL_INITIAL_VISIBLE_LINES = 240;
+const TERMINAL_EXPAND_VISIBLE_LINES = 160;
+const TERMINAL_RUNNING_VISIBLE_LINES = 180;
 
 type JumpTarget = {
   anchorId: string;
@@ -942,6 +957,12 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
   const socketRef = useRef<WebSocket | null>(null);
   const onMessagesLoadedRef = useRef(onMessagesLoaded);
   const onRunStatusChangeRef = useRef(onRunStatusChange);
+  const [isConnected, setIsConnected] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const runStartedAtRef = useRef<number | null>(null);
+  const currentRunDurationMs = runStartedAt ? nowMs - runStartedAt : lastRunDurationMs;
 
   useEffect(() => {
     onMessagesLoadedRef.current = onMessagesLoaded;
@@ -978,6 +999,11 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     const socket = new WebSocket(`${API_WS_BASE_URL}/sessions/${sessionId}/terminal`);
     socketRef.current = socket;
     onRunStatusChangeRef.current(sessionId, 'busy');
+    setIsConnected(false);
+    const startedAt = Date.now();
+    runStartedAtRef.current = startedAt;
+    setRunStartedAt(startedAt);
+    setLastRunDurationMs(null);
 
     const sendResize = () => {
       if (socket.readyState !== WebSocket.OPEN) return;
@@ -985,6 +1011,7 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     };
 
     socket.addEventListener('open', () => {
+      setIsConnected(true);
       sendResize();
     });
     socket.addEventListener('message', (event) => {
@@ -993,8 +1020,14 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
         terminal.write(message.data);
       }
       if (message.type === 'exit') {
-        terminal.writeln(`\r\n[process exited: ${message.exitCode ?? 0}]`);
+        const durationText = runStartedAtRef.current ? `, ${formatRunDuration(Date.now() - runStartedAtRef.current)}` : '';
+        terminal.writeln(`\r\n[process exited: ${message.exitCode ?? 0}${durationText}]`);
         onRunStatusChangeRef.current(sessionId, 'idle');
+        runStartedAtRef.current = null;
+        setRunStartedAt((startedAt) => {
+          if (startedAt) setLastRunDurationMs(Date.now() - startedAt);
+          return null;
+        });
       }
       if (message.type === 'turn_completed') {
         fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
@@ -1005,10 +1038,22 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     });
     socket.addEventListener('close', () => {
       onRunStatusChangeRef.current(sessionId, 'idle');
+      setIsConnected(false);
+      runStartedAtRef.current = null;
+      setRunStartedAt((startedAt) => {
+        if (startedAt) setLastRunDurationMs(Date.now() - startedAt);
+        return null;
+      });
     });
     socket.addEventListener('error', () => {
       terminal.writeln('\r\n[terminal websocket error]');
       onRunStatusChangeRef.current(sessionId, 'idle');
+      setIsConnected(false);
+      runStartedAtRef.current = null;
+      setRunStartedAt((startedAt) => {
+        if (startedAt) setLastRunDurationMs(Date.now() - startedAt);
+        return null;
+      });
     });
 
     const inputDisposable = terminal.onData((data) => {
@@ -1031,12 +1076,25 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     };
   }, [sessionId, title, providerLabel]);
 
+  useEffect(() => {
+    if (!runStartedAt) return undefined;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [runStartedAt]);
+
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-6 p-6">
       <div className="shrink-0 flex justify-between items-center gap-4">
         <div className="flex items-center gap-3">
           <h1 className="text-2xl font-semibold font-display text-on-surface">{providerLabel}</h1>
           <span className="px-2 py-1 bg-secondary/10 text-secondary text-[10px] font-bold border border-secondary/20 rounded">REAL TUI</span>
+          <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest rounded border ${
+            isConnected
+              ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+              : 'border-secondary/20 bg-secondary/10 text-secondary'
+          }`}>
+            TIME: {currentRunDurationMs !== null ? formatRunDuration(currentRunDurationMs) : '0:00'}
+          </span>
         </div>
         <span className="truncate text-slate-500 text-xs font-medium uppercase tracking-tight font-display">{title}</span>
       </div>
@@ -1266,6 +1324,9 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(Date.now());
   const [codexOptions, setCodexOptions] = useState<CodexOptionsResponse>(fallbackCodexOptions);
   const [codexModel, setCodexModel] = useState(fallbackCodexOptions.defaults.model);
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffort>(fallbackCodexOptions.defaults.reasoningEffort);
@@ -1276,7 +1337,9 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const isCodexCli = provider === 'codex-cli';
   const [activeJumpTurnId, setActiveJumpTurnId] = useState<string | null>(null);
   const [activeJumpIndex, setActiveJumpIndex] = useState<number | null>(null);
+  const runStartedAtRef = useRef<number | null>(null);
   const consumedJumpNonceRef = React.useRef<number | null>(null);
+  const [visibleHistoryCount, setVisibleHistoryCount] = useState(TERMINAL_INITIAL_VISIBLE_LINES);
   const [history, setHistory] = useState([
     { type: 'cmd', text: `${provider}-agent ready`, prompt: true },
     { type: 'info', text: `Initializing ${providerLabel} agent...`, color: 'text-slate-500' },
@@ -1284,6 +1347,35 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     { type: 'info', text: 'Status: Web terminal attached.', color: 'text-secondary' },
   ]);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const currentRunDurationMs = runStartedAt ? nowMs - runStartedAt : lastRunDurationMs;
+  const visibleHistoryStart = Math.max(0, history.length - visibleHistoryCount);
+  const visibleHistory = history.slice(visibleHistoryStart);
+
+  const startRunTimer = () => {
+    const startedAt = Date.now();
+    setVisibleHistoryCount(TERMINAL_RUNNING_VISIBLE_LINES);
+    runStartedAtRef.current = startedAt;
+    setRunStartedAt(startedAt);
+    setNowMs(startedAt);
+    setLastRunDurationMs(null);
+  };
+
+  const stopRunTimer = () => {
+    const endedAt = Date.now();
+    const startedAtSnapshot = runStartedAtRef.current;
+    if (startedAtSnapshot) setLastRunDurationMs(endedAt - startedAtSnapshot);
+    runStartedAtRef.current = null;
+    setVisibleHistoryCount(TERMINAL_INITIAL_VISIBLE_LINES);
+    setRunStartedAt((startedAt) => {
+      return null;
+    });
+  };
+
+  React.useEffect(() => {
+    if (!runStartedAt) return undefined;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [runStartedAt]);
 
   React.useEffect(() => {
     if (provider !== 'codex' && provider !== 'codex-cli') return;
@@ -1319,6 +1411,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
       { type: 'info', text: 'Session context: ' + title, color: 'text-blue-400/70' },
       { type: 'info', text: 'Status: Web terminal attached.', color: 'text-secondary' },
     ]);
+    setVisibleHistoryCount(TERMINAL_INITIAL_VISIBLE_LINES);
 
     fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to load messages')))
@@ -1328,26 +1421,28 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         if (latestTitle) onTaskTitle(latestTitle, sessionId);
         onMessagesLoaded(sessionId, data.messages, data.turns || []);
         let userTurnIndex = 0;
+        const loadedHistory = data.messages.flatMap((message) => (
+          message.role === 'assistant'
+            ? buildTerminalHistoryLines(message.content, 'text-slate-300', 'info')
+            : (() => {
+                const turnId = message.role === 'user'
+                  ? (data.turns?.[userTurnIndex++]?.id || message.id)
+                  : undefined;
+                return [{
+                  id: turnId ? `terminal-turn-${turnId}` : undefined,
+                  turnId,
+                  type: message.role === 'user' ? 'cmd' : 'info',
+                  text: message.content,
+                  prompt: message.role === 'user',
+                  color: undefined
+                }];
+              })()
+        ));
         setHistory(prev => [
           ...prev,
-          ...data.messages.flatMap((message) => (
-            message.role === 'assistant'
-              ? buildTerminalHistoryLines(message.content, 'text-slate-300', 'info')
-              : (() => {
-                  const turnId = message.role === 'user'
-                    ? (data.turns?.[userTurnIndex++]?.id || message.id)
-                    : undefined;
-                  return [{
-                    id: turnId ? `terminal-turn-${turnId}` : undefined,
-                    turnId,
-                    type: message.role === 'user' ? 'cmd' : 'info',
-                    text: message.content,
-                    prompt: message.role === 'user',
-                    color: undefined
-                  }];
-                })()
-          ))
+          ...loadedHistory
         ]);
+        setVisibleHistoryCount(TERMINAL_INITIAL_VISIBLE_LINES);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -1365,6 +1460,22 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [history, jumpTarget]);
+
+  React.useEffect(() => {
+    if (visibleHistoryStart !== Math.max(0, history.length - visibleHistoryCount)) return;
+    if (!scrollRef.current) return;
+    if (jumpTarget && consumedJumpNonceRef.current !== jumpTarget.nonce) return;
+
+    window.requestAnimationFrame(() => {
+      if (!scrollRef.current) return;
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    });
+  }, [history.length, jumpTarget, visibleHistoryCount, visibleHistoryStart]);
+
+  React.useEffect(() => {
+    if (!isRunning) return;
+    setVisibleHistoryCount(TERMINAL_RUNNING_VISIBLE_LINES);
+  }, [history.length, isRunning]);
 
   React.useEffect(() => {
     if (!jumpTarget) {
@@ -1385,6 +1496,10 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
       line.id === jumpTarget.anchorId ||
       (line.prompt && targetText.length > 0 && normalizeJumpText(line.text) === targetText)
     ));
+    if (targetIndex >= 0 && targetIndex < visibleHistoryStart) {
+      setVisibleHistoryCount(history.length - targetIndex);
+      return;
+    }
     const target = targetIndex >= 0
       ? scrollRef.current.querySelector<HTMLElement>(`[data-history-index="${targetIndex}"]`)
       : document.getElementById(jumpTarget.anchorId);
@@ -1453,6 +1568,18 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     });
   };
 
+  const handleHistoryScroll = () => {
+    const container = scrollRef.current;
+    if (!container || container.scrollTop > 80 || visibleHistoryStart === 0) return;
+
+    const previousHeight = container.scrollHeight;
+    setVisibleHistoryCount((current) => Math.min(history.length, current + TERMINAL_EXPAND_VISIBLE_LINES));
+    window.requestAnimationFrame(() => {
+      if (!scrollRef.current) return;
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight - previousHeight + container.scrollTop;
+    });
+  };
+
   const handlePaste = (event: React.ClipboardEvent) => {
     if (provider !== 'codex' && provider !== 'codex-cli') return;
 
@@ -1486,6 +1613,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     };
     setActiveJumpTurnId(null);
     setActiveJumpIndex(null);
+    setVisibleHistoryCount(TERMINAL_RUNNING_VISIBLE_LINES);
     setHistory(prev => [...prev, newCmd]);
     const localCommand = prompt.toLowerCase();
     if (localCommand === 'clear') {
@@ -1505,6 +1633,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     attachments.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl));
     setAttachments([]);
     setIsRunning(true);
+    startRunTimer();
     onRunStatusChange(sessionId, 'busy');
     onRunCommand(prompt);
 
@@ -1587,9 +1716,12 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
 
         const data = JSON.parse(dataLine.slice(6));
         if (event === 'status') {
+          const statusDuration = data.status === 'completed' && runStartedAtRef.current
+            ? ` ${formatRunDuration(Date.now() - runStartedAtRef.current)}`
+            : '';
           const statusText = data.status === 'analyzing_images'
             ? `[analyzing_images] ${providerLabel} received ${data.attachmentCount} image${data.attachmentCount === 1 ? '' : 's'} for ${data.model}${data.timeoutSeconds ? `, timeout ${data.timeoutSeconds}s` : ', no timeout'}`
-            : `[${data.status}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`;
+            : `[${data.status}${statusDuration}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`;
           setHistory(prev => [...prev, { type: 'info', text: statusText, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
         }
         if (event === 'task_title') {
@@ -1633,6 +1765,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         color: 'text-error'
       }]);
     } finally {
+      stopRunTimer();
       setIsRunning(false);
       onRunStatusChange(sessionId, 'idle');
     }
@@ -1643,6 +1776,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     const research = pendingResearch;
     setPendingResearch(null);
     setIsRunning(true);
+    startRunTimer();
     onRunStatusChange(sessionId, 'busy');
     onRunCommand(research.prompt);
 
@@ -1671,7 +1805,10 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         if (!event || !dataLine) return;
         const data = JSON.parse(dataLine.slice(6));
         if (event === 'status') {
-          setHistory(prev => [...prev, { type: 'info', text: `[${data.status}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
+          const statusDuration = data.status === 'completed' && runStartedAtRef.current
+            ? ` ${formatRunDuration(Date.now() - runStartedAtRef.current)}`
+            : '';
+          setHistory(prev => [...prev, { type: 'info', text: `[${data.status}${statusDuration}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
         }
         if (event === 'task_title') {
           onTaskTitle(data.title, sessionId);
@@ -1712,6 +1849,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     } catch (error) {
       setHistory(prev => [...prev, { type: 'error', text: error instanceof Error ? error.message : 'Agent run failed', color: 'text-error' }]);
     } finally {
+      stopRunTimer();
       setIsRunning(false);
       onRunStatusChange(sessionId, 'idle');
     }
@@ -1741,6 +1879,13 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
                 : 'border-secondary/20 bg-secondary/10 text-secondary'
             }`}>
               STATUS: {isRunning ? 'BUSY' : 'READY'}
+            </span>
+            <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest rounded border ${
+              isRunning
+                ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+                : 'border-slate-700 bg-slate-900 text-slate-400'
+            }`}>
+              TIME: {currentRunDurationMs !== null ? formatRunDuration(currentRunDurationMs) : '0:00'}
             </span>
             <span className="px-2 py-1 bg-slate-800 text-slate-400 text-[10px] font-bold border border-slate-700 rounded">SESSION: {sessionId.slice(-6)}</span>
           </div>
@@ -1800,17 +1945,35 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         
         <div 
           ref={scrollRef}
+          onScroll={handleHistoryScroll}
           className="flex-1 min-h-0 p-4 font-mono text-sm text-slate-300 overflow-y-auto leading-relaxed hide-scrollbar bg-slate-950/50"
         >
           <div className="space-y-1">
-            {history.map((line, i) => (
-              <TerminalHistoryItem
-                key={i}
-                line={line}
-                index={i}
-                active={i === activeJumpIndex || (!!line.turnId && line.turnId === activeJumpTurnId)}
-              />
-            ))}
+            {visibleHistoryStart > 0 && (
+              <div className="sticky top-0 z-10 mb-2 flex items-center justify-between rounded border border-slate-800 bg-slate-950/95 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-500 backdrop-blur">
+                <span>已隐藏 {visibleHistoryStart} 条历史，上拉加载更多</span>
+                <button
+                  type="button"
+                  onClick={() => setVisibleHistoryCount((current) => Math.min(history.length, current + TERMINAL_EXPAND_VISIBLE_LINES))}
+                  className="rounded border border-slate-700 px-2 py-1 text-slate-400 transition-colors hover:border-blue-500 hover:text-blue-300"
+                >
+                  加载更多
+                </button>
+              </div>
+            )}
+            {visibleHistory.map((line, i) => {
+              const historyIndex = visibleHistoryStart + i;
+
+              return (
+                <React.Fragment key={historyIndex}>
+                  <TerminalHistoryItem
+                    line={line}
+                    index={historyIndex}
+                    active={historyIndex === activeJumpIndex || (!!line.turnId && line.turnId === activeJumpTurnId)}
+                  />
+                </React.Fragment>
+              );
+            })}
             {pendingResearch && (
               <div className="mt-3 rounded border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100">
                 <div className="mb-2 font-bold uppercase tracking-widest text-amber-200">等待确认执行</div>
