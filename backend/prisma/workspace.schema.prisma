@@ -12,6 +12,7 @@ enum AgentProvider {
   CODEX
   CODEX_CLI
   CURSOR
+  TERMINAL
 }
 
 model Session {

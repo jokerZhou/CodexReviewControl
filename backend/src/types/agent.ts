@@ -1,4 +1,4 @@
-export type AgentProvider = 'codex' | 'codex-cli' | 'cursor';
+export type AgentProvider = 'codex' | 'codex-cli' | 'cursor' | 'terminal';
 
 export interface AgentEvent {
   type: 'started' | 'output' | 'completed' | 'failed';

@@ -10,17 +10,19 @@ const createWorkspaceSchema = z.object({
 });
 
 const createSessionSchema = z.object({
-  provider: z.enum(['codex', 'codex-cli', 'cursor']),
+  provider: z.enum(['codex', 'codex-cli', 'cursor', 'terminal']),
   name: z.string().trim().min(1).optional()
 });
 
-const providerToDb = (provider: 'codex' | 'codex-cli' | 'cursor') => {
+const providerToDb = (provider: 'codex' | 'codex-cli' | 'cursor' | 'terminal') => {
   if (provider === 'codex') return AgentProvider.CODEX;
   if (provider === 'codex-cli') return AgentProvider.CODEX_CLI;
+  if (provider === 'terminal') return AgentProvider.TERMINAL;
   return AgentProvider.CURSOR;
 };
 
 const providerFromDb = (provider: AgentProvider) => {
+  if (provider === AgentProvider.TERMINAL) return 'terminal';
   return provider === AgentProvider.CODEX_CLI ? 'codex-cli' : provider.toLowerCase();
 };
 
@@ -138,6 +140,8 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
       ? 'Codex SDK'
       : body.data.provider === 'codex-cli'
         ? 'Codex CLI'
+        : body.data.provider === 'terminal'
+          ? 'Terminal'
         : 'Cursor';
     const session = await db.session.create({
       data: {

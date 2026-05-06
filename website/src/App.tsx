@@ -73,12 +73,21 @@ type TerminalHistoryLine = {
 const TERMINAL_INITIAL_VISIBLE_LINES = 240;
 const TERMINAL_EXPAND_VISIBLE_LINES = 160;
 const TERMINAL_RUNNING_VISIBLE_LINES = 180;
+const ACTIVE_SESSION_STORAGE_KEY = 'reviewdock.activeSessionId';
 
 type JumpTarget = {
   anchorId: string;
   turnId: string;
   text: string;
   nonce: number;
+};
+
+type CurrentTaskInfo = {
+  title: string;
+  prompt: string;
+  status: 'running' | 'completed' | 'idle';
+  startedAt?: number | null;
+  durationMs?: number | null;
 };
 
 const normalizeJumpText = (value: string | null | undefined) => (value || '').replace(/\s+/g, ' ').trim();
@@ -131,6 +140,50 @@ const MarkdownText = ({ text }: { text: string }) => (
     </ReactMarkdown>
   </div>
 );
+
+const CurrentTaskButton = ({ task, fallbackTitle, isRunning, durationMs }: { task: CurrentTaskInfo | null, fallbackTitle: string, isRunning: boolean, durationMs: number | null }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const displayTask: CurrentTaskInfo = task || {
+    title: fallbackTitle,
+    prompt: '当前没有正在运行的任务',
+    status: isRunning ? 'running' : 'idle',
+    durationMs
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+        className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-slate-400 transition-colors hover:border-blue-500 hover:text-blue-300"
+      >
+        当前任务
+      </button>
+      {isOpen && (
+        <div className="absolute left-0 top-full z-50 mt-2 w-80 rounded border border-slate-700 bg-slate-950 p-3 shadow-2xl">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="min-w-0 truncate text-xs font-bold text-blue-300">{displayTask.title || fallbackTitle}</div>
+            <span className={`shrink-0 rounded border px-2 py-0.5 text-[9px] font-bold uppercase ${
+              displayTask.status === 'running'
+                ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
+                : displayTask.status === 'completed'
+                  ? 'border-secondary/20 bg-secondary/10 text-secondary'
+                  : 'border-slate-700 bg-slate-900 text-slate-500'
+            }`}>
+              {displayTask.status}
+            </span>
+          </div>
+          <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+            TIME: {displayTask.durationMs !== null && displayTask.durationMs !== undefined ? formatRunDuration(displayTask.durationMs) : '0:00'}
+          </div>
+          <div className="max-h-44 overflow-y-auto whitespace-pre-wrap rounded border border-slate-800 bg-slate-900/60 p-2 text-xs leading-relaxed text-slate-300 hide-scrollbar">
+            {displayTask.prompt}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 const buildCharDiffOps = (beforeText: string, afterText: string) => {
   const beforeChars = Array.from(beforeText);
@@ -543,7 +596,7 @@ interface Turn {
   summary: string;
 }
 
-type AgentProvider = 'codex' | 'codex-cli' | 'cursor';
+type AgentProvider = 'codex' | 'codex-cli' | 'cursor' | 'terminal';
 type CodexReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AgentRunStatus = 'idle' | 'busy';
 
@@ -868,10 +921,15 @@ const providerMeta: Record<AgentProvider, { label: string; description: string; 
     label: 'Cursor',
     description: 'Cursor Agent session for Cursor-style coding workflows.',
     accent: 'text-secondary border-secondary/40 bg-secondary/10'
+  },
+  terminal: {
+    label: 'Terminal',
+    description: 'Persistent local shell session for workspace commands and manual terminal work.',
+    accent: 'text-amber-300 border-amber-500/40 bg-amber-500/10'
   }
 };
 
-const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: string, onClose: () => void, onSelect: (provider: AgentProvider) => void }) => {
+const SelectAgentModal = ({ projectName, error, isCreating, onClose, onSelect }: { projectName: string, error: string, isCreating: boolean, onClose: () => void, onSelect: (provider: AgentProvider) => void }) => {
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -904,7 +962,8 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
             <button
               key={provider}
               onClick={() => onSelect(provider)}
-              className={`rounded-lg border p-4 text-left transition-colors hover:border-blue-500/70 ${providerMeta[provider].accent}`}
+              disabled={isCreating}
+              className={`rounded-lg border p-4 text-left transition-colors hover:border-blue-500/70 disabled:cursor-wait disabled:opacity-60 ${providerMeta[provider].accent}`}
             >
               <div className="mb-2 flex items-center gap-3">
                 <MessageSquare size={18} />
@@ -913,6 +972,11 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
               <p className="text-xs leading-relaxed text-slate-400">{providerMeta[provider].description}</p>
             </button>
           ))}
+          {error && (
+            <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              {error}
+            </div>
+          )}
         </div>
       </motion.div>
     </motion.div>
@@ -952,16 +1016,19 @@ const TerminalHistoryItem = ({ line, index, active = false }: { line: TerminalHi
   );
 };
 
-const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, onRunStatusChange }: { sessionId: string, title: string, providerLabel: string, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
+const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActive, onMessagesLoaded, onRunStatusChange }: { sessionId: string, title: string, provider: AgentProvider, providerLabel: string, isActive: boolean, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
   const onMessagesLoadedRef = useRef(onMessagesLoaded);
   const onRunStatusChangeRef = useRef(onRunStatusChange);
   const [isConnected, setIsConnected] = useState(false);
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
   const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [currentTask, setCurrentTask] = useState<CurrentTaskInfo | null>(null);
   const runStartedAtRef = useRef<number | null>(null);
+  const isRunning = runStartedAt !== null;
   const currentRunDurationMs = runStartedAt ? nowMs - runStartedAt : lastRunDurationMs;
 
   useEffect(() => {
@@ -988,6 +1055,7 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
       }
     });
     const fitAddon = new FitAddon();
+    fitAddonRef.current = fitAddon;
     terminal.loadAddon(fitAddon);
     terminal.open(terminalRef.current);
     fitAddon.fit();
@@ -998,12 +1066,18 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
 
     const socket = new WebSocket(`${API_WS_BASE_URL}/sessions/${sessionId}/terminal`);
     socketRef.current = socket;
-    onRunStatusChangeRef.current(sessionId, 'busy');
+    onRunStatusChangeRef.current(sessionId, 'idle');
     setIsConnected(false);
-    const startedAt = Date.now();
-    runStartedAtRef.current = startedAt;
-    setRunStartedAt(startedAt);
+    runStartedAtRef.current = null;
+    setRunStartedAt(null);
     setLastRunDurationMs(null);
+    setCurrentTask({
+      title,
+      prompt: provider === 'terminal' ? '持久化 Shell 会话' : '等待 Codex CLI 输入任务',
+      status: 'idle',
+      startedAt: null,
+      durationMs: null
+    });
 
     const sendResize = () => {
       if (socket.readyState !== WebSocket.OPEN) return;
@@ -1015,21 +1089,52 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
       sendResize();
     });
     socket.addEventListener('message', (event) => {
-      const message = JSON.parse(String(event.data)) as { type: string; data?: string; exitCode?: number };
+      const message = JSON.parse(String(event.data)) as { type: string; data?: string; exitCode?: number; taskTitle?: string; prompt?: string; startedAt?: number };
       if (message.type === 'output' && typeof message.data === 'string') {
         terminal.write(message.data);
+      }
+      if (message.type === 'turn_started') {
+        const startedAt = typeof message.startedAt === 'number' ? message.startedAt : Date.now();
+        onRunStatusChangeRef.current(sessionId, 'busy');
+        runStartedAtRef.current = startedAt;
+        setRunStartedAt(startedAt);
+        setNowMs(startedAt);
+        setLastRunDurationMs(null);
+        setCurrentTask({
+          title: message.taskTitle || message.prompt || title,
+          prompt: message.prompt || '',
+          status: 'running',
+          startedAt,
+          durationMs: 0
+        });
       }
       if (message.type === 'exit') {
         const durationText = runStartedAtRef.current ? `, ${formatRunDuration(Date.now() - runStartedAtRef.current)}` : '';
         terminal.writeln(`\r\n[process exited: ${message.exitCode ?? 0}${durationText}]`);
         onRunStatusChangeRef.current(sessionId, 'idle');
+        setCurrentTask((task) => task ? {
+          ...task,
+          status: 'completed',
+          durationMs: task.startedAt ? Date.now() - task.startedAt : lastRunDurationMs
+        } : task);
         runStartedAtRef.current = null;
         setRunStartedAt((startedAt) => {
           if (startedAt) setLastRunDurationMs(Date.now() - startedAt);
           return null;
         });
       }
-      if (message.type === 'turn_completed') {
+      if (message.type === 'turn_completed' && provider === 'codex-cli') {
+        onRunStatusChangeRef.current(sessionId, 'idle');
+        setCurrentTask((task) => task ? {
+          ...task,
+          status: 'completed',
+          durationMs: task.startedAt ? Date.now() - task.startedAt : lastRunDurationMs
+        } : task);
+        runStartedAtRef.current = null;
+        setRunStartedAt((startedAt) => {
+          if (startedAt) setLastRunDurationMs(Date.now() - startedAt);
+          return null;
+        });
         fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`)
           .then((response) => response.ok ? response.json() : Promise.reject(new Error('Failed to reload turn details')))
           .then((payload: { messages: ApiMessage[], turns: ApiTurn[] }) => onMessagesLoadedRef.current(sessionId, payload.messages, payload.turns || []))
@@ -1070,11 +1175,12 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     return () => {
       inputDisposable.dispose();
       resizeObserver.disconnect();
+      fitAddonRef.current = null;
       socket.close();
       terminal.dispose();
       onRunStatusChangeRef.current(sessionId, 'idle');
     };
-  }, [sessionId, title, providerLabel]);
+  }, [provider, sessionId, title, providerLabel]);
 
   useEffect(() => {
     if (!runStartedAt) return undefined;
@@ -1082,19 +1188,32 @@ const CodexCliTerminal = ({ sessionId, title, providerLabel, onMessagesLoaded, o
     return () => window.clearInterval(timer);
   }, [runStartedAt]);
 
+  useEffect(() => {
+    if (!isActive) return;
+    window.setTimeout(() => fitAddonRef.current?.fit(), 0);
+  }, [isActive]);
+
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-6 p-6">
       <div className="shrink-0 flex justify-between items-center gap-4">
         <div className="flex items-center gap-3">
           <h1 className="text-2xl font-semibold font-display text-on-surface">{providerLabel}</h1>
-          <span className="px-2 py-1 bg-secondary/10 text-secondary text-[10px] font-bold border border-secondary/20 rounded">REAL TUI</span>
+          <span className="px-2 py-1 bg-secondary/10 text-secondary text-[10px] font-bold border border-secondary/20 rounded">
+            {provider === 'terminal' ? 'PERSISTENT SHELL' : 'REAL TUI'}
+          </span>
           <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-widest rounded border ${
-            isConnected
+            isRunning
               ? 'border-amber-400/30 bg-amber-400/10 text-amber-300'
               : 'border-secondary/20 bg-secondary/10 text-secondary'
           }`}>
             TIME: {currentRunDurationMs !== null ? formatRunDuration(currentRunDurationMs) : '0:00'}
           </span>
+          <CurrentTaskButton
+            task={currentTask}
+            fallbackTitle={title}
+            isRunning={isRunning}
+            durationMs={currentRunDurationMs}
+          />
         </div>
         <span className="truncate text-slate-500 text-xs font-medium uppercase tracking-tight font-display">{title}</span>
       </div>
@@ -1320,13 +1439,14 @@ const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, o
   );
 };
 
-const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onTaskTitle, onMessagesLoaded, onRunStatusChange, jumpTarget }: { sessionId: string, title: string, provider?: AgentProvider, onRunCommand: (msg: string) => void, onTaskTitle: (title: string, sessionId: string) => void, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void, jumpTarget?: JumpTarget | null }) => {
+const TerminalBlock = ({ sessionId, title, provider = 'codex', isActive = true, onRunCommand, onTaskTitle, onMessagesLoaded, onRunStatusChange, jumpTarget }: { sessionId: string, title: string, provider?: AgentProvider, isActive?: boolean, onRunCommand: (msg: string) => void, onTaskTitle: (title: string, sessionId: string) => void, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void, jumpTarget?: JumpTarget | null }) => {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
   const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [currentTask, setCurrentTask] = useState<CurrentTaskInfo | null>(null);
   const [codexOptions, setCodexOptions] = useState<CodexOptionsResponse>(fallbackCodexOptions);
   const [codexModel, setCodexModel] = useState(fallbackCodexOptions.defaults.model);
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffort>(fallbackCodexOptions.defaults.reasoningEffort);
@@ -1335,6 +1455,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const [pendingResearch, setPendingResearch] = useState<ResearchPlanResponse['researchPlan'] | null>(null);
   const providerLabel = providerMeta[provider].label;
   const isCodexCli = provider === 'codex-cli';
+  const isInteractiveTerminal = provider === 'codex-cli' || provider === 'terminal';
   const [activeJumpTurnId, setActiveJumpTurnId] = useState<string | null>(null);
   const [activeJumpIndex, setActiveJumpIndex] = useState<number | null>(null);
   const runStartedAtRef = useRef<number | null>(null);
@@ -1364,6 +1485,13 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     const endedAt = Date.now();
     const startedAtSnapshot = runStartedAtRef.current;
     if (startedAtSnapshot) setLastRunDurationMs(endedAt - startedAtSnapshot);
+    if (startedAtSnapshot) {
+      setCurrentTask((task) => task ? {
+        ...task,
+        status: 'completed',
+        durationMs: endedAt - startedAtSnapshot
+      } : task);
+    }
     runStartedAtRef.current = null;
     setVisibleHistoryCount(TERMINAL_INITIAL_VISIBLE_LINES);
     setRunStartedAt((startedAt) => {
@@ -1634,6 +1762,13 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     setAttachments([]);
     setIsRunning(true);
     startRunTimer();
+    setCurrentTask({
+      title: prompt.length > 24 ? prompt.slice(0, 24) : prompt,
+      prompt: attachmentCount > 0 ? `${prompt}\n[${attachmentCount} image attachment${attachmentCount === 1 ? '' : 's'}]` : prompt,
+      status: 'running',
+      startedAt: Date.now(),
+      durationMs: 0
+    });
     onRunStatusChange(sessionId, 'busy');
     onRunCommand(prompt);
 
@@ -1726,6 +1861,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         }
         if (event === 'task_title') {
           onTaskTitle(data.title, sessionId);
+          setCurrentTask((task) => task ? { ...task, title: data.title } : task);
           setHistory(prev => [...prev, { type: 'info', text: `Task: ${data.title}`, color: 'text-blue-400' }]);
         }
         if (event === 'chunk') {
@@ -1777,6 +1913,13 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     setPendingResearch(null);
     setIsRunning(true);
     startRunTimer();
+    setCurrentTask({
+      title: research.prompt.length > 24 ? research.prompt.slice(0, 24) : research.prompt,
+      prompt: research.prompt,
+      status: 'running',
+      startedAt: Date.now(),
+      durationMs: 0
+    });
     onRunStatusChange(sessionId, 'busy');
     onRunCommand(research.prompt);
 
@@ -1812,6 +1955,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         }
         if (event === 'task_title') {
           onTaskTitle(data.title, sessionId);
+          setCurrentTask((task) => task ? { ...task, title: data.title } : task);
           setHistory(prev => [...prev, { type: 'info', text: `Task: ${data.title}`, color: 'text-blue-400' }]);
         }
         if (event === 'research_confirmed') {
@@ -1855,12 +1999,14 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     }
   };
 
-  if (isCodexCli) {
+  if (isInteractiveTerminal) {
     return (
-      <CodexCliTerminal
+      <InteractiveTerminal
         sessionId={sessionId}
         title={title}
+        provider={provider}
         providerLabel={providerLabel}
+        isActive={isActive}
         onMessagesLoaded={onMessagesLoaded}
         onRunStatusChange={onRunStatusChange}
       />
@@ -1887,6 +2033,12 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
             }`}>
               TIME: {currentRunDurationMs !== null ? formatRunDuration(currentRunDurationMs) : '0:00'}
             </span>
+            <CurrentTaskButton
+              task={currentTask}
+              fallbackTitle={title}
+              isRunning={isRunning}
+              durationMs={currentRunDurationMs}
+            />
             <span className="px-2 py-1 bg-slate-800 text-slate-400 text-[10px] font-bold border border-slate-700 rounded">SESSION: {sessionId.slice(-6)}</span>
           </div>
         </div>
@@ -3605,6 +3757,8 @@ export default function App() {
   const [jumpTarget, setJumpTarget] = useState<JumpTarget | null>(null);
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
   const [pendingSessionProjectId, setPendingSessionProjectId] = useState<string | null>(null);
+  const [pendingSessionError, setPendingSessionError] = useState('');
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
   const [isDeletingWorkspace, setIsDeletingWorkspace] = useState(false);
@@ -3651,6 +3805,26 @@ export default function App() {
       console.error(error);
     });
   }, []);
+
+  useEffect(() => {
+    if (activeItem) {
+      window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeItem);
+      return;
+    }
+    window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+  }, [activeItem]);
+
+  useEffect(() => {
+    if (activeItem || projects.length === 0) return;
+    const stored = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+    if (!stored) return;
+    const exists = projects.some((project) => project.items.some((item) => item.id === stored));
+    if (!exists) {
+      window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      return;
+    }
+    setActiveItem(stored);
+  }, [activeItem, projects]);
 
   useEffect(() => {
     if (!activeItem) return;
@@ -3884,6 +4058,7 @@ export default function App() {
           sessionStatuses={sessionStatuses}
           onNewSession={(projectId) => {
             setJumpTarget(null);
+            setPendingSessionError('');
             setPendingSessionProjectId(projectId);
           }}
           onOpenAddProject={() => setIsAddProjectOpen(true)}
@@ -3902,13 +4077,14 @@ export default function App() {
               return (
                 <div
                   key={session.id}
-                  className={`absolute inset-0 min-h-0 flex-col ${isActive ? 'flex' : 'hidden'}`}
+                  className={`absolute inset-0 flex min-h-0 flex-col ${isActive ? 'visible z-10 opacity-100' : 'invisible z-0 opacity-0 pointer-events-none'}`}
                   aria-hidden={!isActive}
                 >
                   <TerminalBlock
                     sessionId={session.id}
                     title={session.name || session.id.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
                     provider={session.provider || 'codex'}
+                    isActive={isActive}
                     onRunCommand={handleNewTurn}
                     onTaskTitle={handleTaskTitle}
                     onMessagesLoaded={handleMessagesLoaded}
@@ -3964,10 +4140,28 @@ export default function App() {
         {pendingSessionProject && (
           <SelectAgentModal
             projectName={pendingSessionProject.name}
-            onClose={() => setPendingSessionProjectId(null)}
-            onSelect={(provider) => {
-              handleNewSession(pendingSessionProject.id, provider).catch((error) => console.error(error));
+            error={pendingSessionError}
+            isCreating={isCreatingSession}
+            onClose={() => {
+              if (isCreatingSession) return;
               setPendingSessionProjectId(null);
+              setPendingSessionError('');
+            }}
+            onSelect={(provider) => {
+              setIsCreatingSession(true);
+              setPendingSessionError('');
+              handleNewSession(pendingSessionProject.id, provider)
+                .then(() => {
+                  setPendingSessionProjectId(null);
+                  setPendingSessionError('');
+                })
+                .catch((error) => {
+                  console.error(error);
+                  setPendingSessionError(error instanceof Error ? error.message : 'Failed to create session');
+                })
+                .finally(() => {
+                  setIsCreatingSession(false);
+                });
             }}
           />
         )}
