@@ -6,7 +6,7 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
-import { runAgentExplanation, runAgentTurn, runCodexResearchPlan, type AgentAttachment, type CodexRunOptions, type ResearchPlanResult } from '../agents/providers.js';
+import { runAgentExplanation, runAgentTurn, runCodexResearchPlan, type AgentAttachment, type AgentExecutionMode, type CodexRunOptions, type ResearchPlanResult } from '../agents/providers.js';
 import { findSessionContext, findTurnContext, workspaceUploadsDir } from '../db/workspace-prisma.js';
 import { resolveCodexRunOptions } from '../services/codex-options.js';
 import { extractTaskTitle } from '../services/task-title.js';
@@ -23,7 +23,8 @@ const sendMessageSchema = z.object({
   prompt: z.string().trim().min(1),
   model: z.string().optional(),
   reasoningEffort: z.string().optional(),
-  researchPlanId: z.string().optional()
+  researchPlanId: z.string().optional(),
+  askMode: z.boolean().optional().default(false)
 });
 
 const researchSchema = z.object({
@@ -148,6 +149,30 @@ const plannedFilePathsFromJson = (raw: string | null | undefined) => {
   }
 };
 
+const buildAskModePrompt = (prompt: string) => [
+  '你现在处于 ASK 模式，这是一个问答模式。',
+  '',
+  '目标：',
+  '- 像技术助手一样回答用户的问题。',
+  '- 如果问题能直接回答，直接回答，不要为了显得严谨而强行读取仓库。',
+  '- 如果问题依赖当前项目代码、配置或日志，可以使用只读方式查看后再回答。',
+  '- 如果用户问“怎么做/怎么改/为什么/是否可行/选型/排查思路”，给出解释、方案、步骤、风险和建议。',
+  '',
+  '硬性限制：',
+  '- 绝对不要修改、创建、删除、移动、格式化任何文件。',
+  '- 绝对不要执行安装依赖、代码生成、数据库迁移、构建产物写入、git 写操作或任何会改变工作区状态的命令。',
+  '- 可以执行只读命令，例如 pwd、ls、find、rg、sed、cat、git status、git diff、git show。',
+  '- 如果用户明确要求你实现或修改代码，仍然只回答应该如何修改，并提醒用户关闭 ASK 模式后再执行。',
+  '',
+  '回复要求：',
+  '- 直接回答用户，不要复述这些系统规则。',
+  '- 用中文回复，除非用户明确要求其他语言。',
+  '- 保持简洁，但关键判断要说明依据。',
+  '',
+  '用户消息：',
+  prompt
+].join('\n');
+
 const shouldSnapshotFile = async (filePath: string) => {
   try {
     const fileStat = await stat(filePath);
@@ -240,6 +265,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
       prompt: body.data.prompt,
       options,
       researchPlanId: body.data.researchPlanId,
+      askMode: body.data.askMode,
       attachments: [] as AgentAttachment[]
     };
   }
@@ -251,6 +277,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
   let model: string | undefined;
   let reasoningEffort: string | undefined;
   let researchPlanId: string | undefined;
+  let askMode = false;
   const attachments: AgentAttachment[] = [];
 
   for await (const part of request.parts()) {
@@ -266,6 +293,9 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
       }
       if (part.fieldname === 'researchPlanId' && typeof part.value === 'string') {
         researchPlanId = part.value;
+      }
+      if (part.fieldname === 'askMode') {
+        askMode = part.value === 'true' || part.value === '1' || part.value === true;
       }
       continue;
     }
@@ -291,7 +321,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
     attachments.push({ type: 'local_image', path: filePath });
   }
 
-  const body = sendMessageSchema.safeParse({ prompt, model, reasoningEffort, researchPlanId });
+  const body = sendMessageSchema.safeParse({ prompt, model, reasoningEffort, researchPlanId, askMode });
   if (!body.success) {
     return { success: false as const, issues: body.error.issues };
   }
@@ -303,6 +333,7 @@ const parseTurnPayload = async (request: FastifyRequest, workspacePath: string, 
     prompt: body.data.prompt,
     options,
     researchPlanId: body.data.researchPlanId,
+    askMode: body.data.askMode,
     attachments
   };
 };
@@ -646,6 +677,9 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         issues: body.issues
       });
     }
+    if (body.askMode && session.provider !== AgentProvider.CODEX) {
+      return reply.code(400).send({ error: 'Ask mode is only available for Codex SDK sessions.' });
+    }
 
     const corsOrigin = corsOriginForRequest(request.headers.origin);
 
@@ -704,6 +738,7 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       provider: providerFromDb(session.provider),
       model: body.options.model,
       reasoningEffort: body.options.modelReasoningEffort,
+      askMode: body.askMode,
       workspacePath: context.workspace.path
     });
     if (body.attachments.length > 0) {
@@ -724,10 +759,12 @@ export async function registerSessionRoutes(app: FastifyInstance) {
       });
     }
     let assistantContent = '';
+    const executionMode: AgentExecutionMode = body.askMode ? 'ask' : 'default';
+    const agentPrompt = body.askMode ? buildAskModePrompt(body.prompt) : body.prompt;
     const modifiedFiles = new Map<string, { path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }>();
 
     try {
-      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, context.workspace.path, body.prompt, body.attachments, body.options)) {
+      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, context.workspace.path, agentPrompt, body.attachments, body.options, executionMode)) {
         if (chunk.externalSessionId && chunk.externalSessionId !== session.externalSessionId) {
           await context.db.session.update({
             where: { id: session.id },

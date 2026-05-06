@@ -21,6 +21,8 @@ export interface CodexRunOptions {
   imageTurnTimeoutMs: number;
 }
 
+export type AgentExecutionMode = 'default' | 'ask';
+
 export interface AgentExplanationResult {
   text: string;
   externalSessionId?: string;
@@ -80,8 +82,8 @@ const formatCodexEvent = (event: ThreadEvent) => {
   }
 };
 
-async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
-  const threadKey = `${sessionId}:${options.model}:${options.modelReasoningEffort}`;
+async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default'): AsyncGenerator<AgentChunk> {
+  const threadKey = `${sessionId}:${options.model}:${options.modelReasoningEffort}:${mode}`;
   let thread = codexThreads.get(threadKey);
   if (!thread) {
     thread = codex.startThread({
@@ -89,8 +91,8 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
       modelReasoningEffort: options.modelReasoningEffort,
       workingDirectory: workspacePath,
       skipGitRepoCheck: true,
-      sandboxMode: 'workspace-write',
-      approvalPolicy: 'on-request'
+      sandboxMode: mode === 'ask' ? 'read-only' : 'workspace-write',
+      approvalPolicy: mode === 'ask' ? 'never' : 'on-request'
     });
     codexThreads.set(threadKey, thread);
   }
@@ -394,9 +396,9 @@ async function* runCodexCliTurn(sessionExternalId: string | null | undefined, wo
   }
 }
 
-export async function* runAgentTurn(provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
+export async function* runAgentTurn(provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default'): AsyncGenerator<AgentChunk> {
   if (provider === 'CODEX') {
-    yield* runCodexSdkTurn(sessionId, workspacePath, prompt, attachments, options);
+    yield* runCodexSdkTurn(sessionId, workspacePath, prompt, attachments, options, mode);
     return;
   }
 

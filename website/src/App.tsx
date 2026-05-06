@@ -5,9 +5,11 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import ReactMarkdown from 'react-markdown';
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
+import remarkGfm from 'remark-gfm';
 import { 
   Terminal, 
   Search, 
@@ -39,6 +41,7 @@ import { motion, AnimatePresence } from 'motion/react';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
 const API_WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
+console.log('[ReviewDock jump] diagnostics enabled');
 
 const splitLines = (text: string | null | undefined) => (text || '').replace(/\r\n/g, '\n').split('\n');
 const reviewPaneText = (text: string | null | undefined, emptyLabel: string) => text && text.length > 0 ? text : emptyLabel;
@@ -46,6 +49,8 @@ const hasReviewSnapshot = (text: string | null | undefined) => text !== null && 
 
 type DiffOp = { kind: 'same' | 'add' | 'delete'; text: string };
 type TerminalHistoryLine = {
+  id?: string;
+  turnId?: string;
   type: string;
   text: string;
   prompt?: boolean;
@@ -53,6 +58,15 @@ type TerminalHistoryLine = {
   collapsible?: boolean;
   summary?: string;
 };
+
+type JumpTarget = {
+  anchorId: string;
+  turnId: string;
+  text: string;
+  nonce: number;
+};
+
+const normalizeJumpText = (value: string | null | undefined) => (value || '').replace(/\s+/g, ' ').trim();
 
 const buildTerminalHistoryLine = (text: string, color?: string, type = 'info'): TerminalHistoryLine => {
   const normalized = text.replace(/\r\n/g, '\n').trimEnd();
@@ -94,6 +108,14 @@ const buildTerminalHistoryLines = (text: string, color?: string, type = 'info'):
     return !(line.text.startsWith('$ ') && !line.collapsible && next?.collapsible && next.summary === line.text);
   });
 };
+
+const MarkdownText = ({ text }: { text: string }) => (
+  <div className="min-w-0 flex-1 overflow-hidden [&_a]:text-blue-300 [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-slate-700 [&_blockquote]:pl-3 [&_blockquote]:text-slate-400 [&_code]:rounded [&_code]:bg-slate-900 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.95em] [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-1 [&_pre]:overflow-x-auto [&_pre]:rounded [&_pre]:border [&_pre]:border-slate-800 [&_pre]:bg-slate-950 [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_table]:text-xs [&_tbody_tr]:border-t [&_tbody_tr]:border-slate-800 [&_td]:border [&_td]:border-slate-800 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-slate-700 [&_th]:bg-slate-900 [&_th]:px-2 [&_th]:py-1 [&_ul]:list-disc [&_ul]:pl-5">
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      {text}
+    </ReactMarkdown>
+  </div>
+);
 
 const buildCharDiffOps = (beforeText: string, afterText: string) => {
   const beforeChars = Array.from(beforeText);
@@ -496,6 +518,7 @@ interface ModifiedFile {
 
 interface Turn {
   id: string;
+  anchorId?: string;
   userMessage: string;
   taskTitle?: string;
   timestamp: string;
@@ -881,29 +904,35 @@ const SelectAgentModal = ({ projectName, onClose, onSelect }: { projectName: str
   );
 };
 
-const TerminalHistoryItem = ({ line }: { line: TerminalHistoryLine }) => {
+const TerminalHistoryItem = ({ line, index, active = false }: { line: TerminalHistoryLine; index: number; active?: boolean }) => {
   const [expanded, setExpanded] = useState(false);
   const displayText = line.collapsible && !expanded ? (line.summary || line.text) : line.text;
 
   if (line.collapsible) {
     return (
       <button
+        id={line.id}
+        data-history-index={index}
         type="button"
         onClick={() => setExpanded((current) => !current)}
-        className={`flex w-full items-start gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-slate-900/70 ${line.color || ''}`}
+        className={`flex w-full items-start gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-slate-900/70 ${active ? 'bg-emerald-500/10 ring-1 ring-emerald-400/50' : ''} ${line.color || ''}`}
         title={expanded ? '点击收起命令输出' : '点击查看命令输出'}
       >
         {line.prompt && <span className="shrink-0 font-bold text-blue-400">➜</span>}
         <span className="shrink-0 text-slate-600">{expanded ? '▾' : '▸'}</span>
-        <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{displayText}</span>
+        {expanded ? (
+          <MarkdownText text={displayText} />
+        ) : (
+          <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{displayText}</span>
+        )}
       </button>
     );
   }
 
   return (
-    <div className={`flex items-start gap-2 ${line.color || ''}`}>
+    <div id={line.id} data-history-index={index} className={`flex items-start gap-2 rounded px-1 py-0.5 transition-colors ${active ? 'bg-emerald-500/10 ring-1 ring-emerald-400/50' : ''} ${line.color || ''}`}>
       {line.prompt && <span className="shrink-0 font-bold text-blue-400">➜</span>}
-      <span className="whitespace-pre-wrap break-words">{displayText}</span>
+      <MarkdownText text={displayText} />
     </div>
   );
 };
@@ -1233,7 +1262,7 @@ const WorkspacePane = ({ activeItem, setActiveItem, projects, sessionStatuses, o
   );
 };
 
-const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onTaskTitle, onMessagesLoaded, onRunStatusChange }: { sessionId: string, title: string, provider?: AgentProvider, onRunCommand: (msg: string) => void, onTaskTitle: (title: string, sessionId: string) => void, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
+const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onTaskTitle, onMessagesLoaded, onRunStatusChange, jumpTarget }: { sessionId: string, title: string, provider?: AgentProvider, onRunCommand: (msg: string) => void, onTaskTitle: (title: string, sessionId: string) => void, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void, jumpTarget?: JumpTarget | null }) => {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isRunning, setIsRunning] = useState(false);
@@ -1241,9 +1270,13 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   const [codexModel, setCodexModel] = useState(fallbackCodexOptions.defaults.model);
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffort>(fallbackCodexOptions.defaults.reasoningEffort);
   const [researchConfirmEnabled, setResearchConfirmEnabled] = useState(false);
+  const [askModeEnabled, setAskModeEnabled] = useState(false);
   const [pendingResearch, setPendingResearch] = useState<ResearchPlanResponse['researchPlan'] | null>(null);
   const providerLabel = providerMeta[provider].label;
   const isCodexCli = provider === 'codex-cli';
+  const [activeJumpTurnId, setActiveJumpTurnId] = useState<string | null>(null);
+  const [activeJumpIndex, setActiveJumpIndex] = useState<number | null>(null);
+  const consumedJumpNonceRef = React.useRef<number | null>(null);
   const [history, setHistory] = useState([
     { type: 'cmd', text: `${provider}-agent ready`, prompt: true },
     { type: 'info', text: `Initializing ${providerLabel} agent...`, color: 'text-slate-500' },
@@ -1294,17 +1327,25 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         const latestTitle = [...data.messages].reverse().find((message) => message.taskTitle)?.taskTitle;
         if (latestTitle) onTaskTitle(latestTitle, sessionId);
         onMessagesLoaded(sessionId, data.messages, data.turns || []);
+        let userTurnIndex = 0;
         setHistory(prev => [
           ...prev,
           ...data.messages.flatMap((message) => (
             message.role === 'assistant'
               ? buildTerminalHistoryLines(message.content, 'text-slate-300', 'info')
-              : [{
-                  type: message.role === 'user' ? 'cmd' : 'info',
-                  text: message.content,
-                  prompt: message.role === 'user',
-                  color: undefined
-                }]
+              : (() => {
+                  const turnId = message.role === 'user'
+                    ? (data.turns?.[userTurnIndex++]?.id || message.id)
+                    : undefined;
+                  return [{
+                    id: turnId ? `terminal-turn-${turnId}` : undefined,
+                    turnId,
+                    type: message.role === 'user' ? 'cmd' : 'info',
+                    text: message.content,
+                    prompt: message.role === 'user',
+                    color: undefined
+                  }];
+                })()
           ))
         ]);
       })
@@ -1319,10 +1360,81 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
   }, [sessionId, provider, providerLabel, title]);
 
   React.useEffect(() => {
+    if (jumpTarget && consumedJumpNonceRef.current !== jumpTarget.nonce) return;
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [history]);
+  }, [history, jumpTarget]);
+
+  React.useEffect(() => {
+    if (!jumpTarget) {
+      console.log('[ReviewDock jump] skipped: no jumpTarget');
+      return;
+    }
+    if (consumedJumpNonceRef.current === jumpTarget.nonce) {
+      console.log('[ReviewDock jump] skipped: target already consumed', jumpTarget);
+      return;
+    }
+    if (!scrollRef.current) {
+      console.log('[ReviewDock jump] skipped: scroll container missing', jumpTarget);
+      return;
+    }
+    const targetText = normalizeJumpText(jumpTarget.text);
+    const targetIndex = history.findIndex((line) => (
+      line.turnId === jumpTarget.turnId ||
+      line.id === jumpTarget.anchorId ||
+      (line.prompt && targetText.length > 0 && normalizeJumpText(line.text) === targetText)
+    ));
+    const target = targetIndex >= 0
+      ? scrollRef.current.querySelector<HTMLElement>(`[data-history-index="${targetIndex}"]`)
+      : document.getElementById(jumpTarget.anchorId);
+    console.log('[ReviewDock jump] requested', {
+      jumpTarget,
+      historyCount: history.length,
+      scrollTop: scrollRef.current.scrollTop,
+      scrollHeight: scrollRef.current.scrollHeight,
+      clientHeight: scrollRef.current.clientHeight,
+      targetIndex,
+      targetFound: !!target,
+      availableAnchors: history
+        .map((line, index) => ({ index, id: line.id, turnId: line.turnId, prompt: !!line.prompt, text: line.text.slice(0, 80) }))
+        .filter((line) => line.id || line.prompt)
+    });
+    if (!target) {
+      console.log('[ReviewDock jump] failed: target not found', {
+        wantedTurnId: jumpTarget.turnId,
+        wantedAnchorId: jumpTarget.anchorId,
+        wantedText: targetText.slice(0, 160)
+      });
+      return;
+    }
+    const containerRect = scrollRef.current.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const nextTop = Math.max(0, scrollRef.current.scrollTop + targetRect.top - containerRect.top - scrollRef.current.clientHeight / 3);
+    console.log('[ReviewDock jump] scrolling', {
+      before: scrollRef.current.scrollTop,
+      nextTop,
+      containerRect,
+      targetRect
+    });
+    scrollRef.current.scrollTo({
+      top: nextTop,
+      behavior: 'smooth'
+    });
+    consumedJumpNonceRef.current = jumpTarget.nonce;
+    window.setTimeout(() => {
+      console.log('[ReviewDock jump] after scroll', {
+        after: scrollRef.current?.scrollTop,
+        anchorId: jumpTarget.anchorId
+      });
+    }, 350);
+    setActiveJumpTurnId(jumpTarget.turnId);
+    setActiveJumpIndex(targetIndex >= 0 ? targetIndex : null);
+    window.setTimeout(() => {
+      setActiveJumpTurnId(null);
+      setActiveJumpIndex(null);
+    }, 1600);
+  }, [jumpTarget, history]);
 
   React.useEffect(() => {
     return () => {
@@ -1364,11 +1476,16 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
     if (!prompt || isRunning) return;
 
     const attachmentCount = attachments.length;
+    const localTurnId = `turn-${(history.filter((line) => line.prompt).length || 0) + 1}`;
     const newCmd = {
+      id: `terminal-local-${localTurnId}`,
+      turnId: localTurnId,
       type: 'cmd',
       text: attachmentCount > 0 ? `${prompt}\n[${attachmentCount} image attachment${attachmentCount === 1 ? '' : 's'}]` : prompt,
       prompt: true
     };
+    setActiveJumpTurnId(null);
+    setActiveJumpIndex(null);
     setHistory(prev => [...prev, newCmd]);
     const localCommand = prompt.toLowerCase();
     if (localCommand === 'clear') {
@@ -1438,13 +1555,15 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
             formData.append('prompt', prompt);
             formData.append('model', codexModel);
             formData.append('reasoningEffort', codexReasoningEffort);
+            formData.append('askMode', String(askModeEnabled));
             filesToSend.forEach(file => formData.append('attachments', file));
             return formData;
           })()
         : JSON.stringify({
             prompt,
             model: codexModel,
-            reasoningEffort: codexReasoningEffort
+            reasoningEffort: codexReasoningEffort,
+            askMode: askModeEnabled
           });
 
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/turns`, {
@@ -1470,7 +1589,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         if (event === 'status') {
           const statusText = data.status === 'analyzing_images'
             ? `[analyzing_images] ${providerLabel} received ${data.attachmentCount} image${data.attachmentCount === 1 ? '' : 's'} for ${data.model}${data.timeoutSeconds ? `, timeout ${data.timeoutSeconds}s` : ', no timeout'}`
-            : `[${data.status}] ${providerLabel}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`;
+            : `[${data.status}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`;
           setHistory(prev => [...prev, { type: 'info', text: statusText, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
         }
         if (event === 'task_title') {
@@ -1552,7 +1671,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         if (!event || !dataLine) return;
         const data = JSON.parse(dataLine.slice(6));
         if (event === 'status') {
-          setHistory(prev => [...prev, { type: 'info', text: `[${data.status}] ${providerLabel}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
+          setHistory(prev => [...prev, { type: 'info', text: `[${data.status}] ${providerLabel}${data.askMode ? ' ASK' : ''}${data.status === 'started' && data.model ? ` (${data.model}, ${data.reasoningEffort})` : ''}`, color: data.status === 'completed' ? 'text-secondary' : 'text-blue-400' }]);
         }
         if (event === 'task_title') {
           onTaskTitle(data.title, sessionId);
@@ -1685,7 +1804,12 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
         >
           <div className="space-y-1">
             {history.map((line, i) => (
-              <TerminalHistoryItem key={i} line={line} />
+              <TerminalHistoryItem
+                key={i}
+                line={line}
+                index={i}
+                active={i === activeJumpIndex || (!!line.turnId && line.turnId === activeJumpTurnId)}
+              />
             ))}
             {pendingResearch && (
               <div className="mt-3 rounded border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-100">
@@ -1778,7 +1902,37 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', onRunCommand, onT
                 <button
                   type="button"
                   disabled={isRunning}
-                  onClick={() => setResearchConfirmEnabled((current) => !current)}
+                  onClick={() => {
+                    setAskModeEnabled((current) => {
+                      const next = !current;
+                      if (next) {
+                        setResearchConfirmEnabled(false);
+                        setPendingResearch(null);
+                      }
+                      return next;
+                    });
+                  }}
+                  className={`shrink-0 rounded border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                    askModeEnabled
+                      ? 'border-emerald-400/50 bg-emerald-400/10 text-emerald-200'
+                      : 'border-slate-800 bg-slate-900 text-slate-500 hover:border-blue-500 hover:text-blue-300'
+                  }`}
+                  title="开启后本次对话只允许读取和回复，不允许修改文件"
+                >
+                  Ask：{askModeEnabled ? '开' : '关'}
+                </button>
+              )}
+              {provider === 'codex' && (
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => {
+                    setResearchConfirmEnabled((current) => {
+                      const next = !current;
+                      if (next) setAskModeEnabled(false);
+                      return next;
+                    });
+                  }}
                   className={`shrink-0 rounded border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                     researchConfirmEnabled
                       ? 'border-amber-400/50 bg-amber-400/10 text-amber-200'
@@ -2728,7 +2882,7 @@ const TurnDetailModal = ({ turn, turns, workspace, onClose }: { turn: Turn, turn
   );
 };
 
-const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], workspace?: WorkspaceProject, onOpenCodeStory: () => void }) => {
+const RightPanel = ({ turns, workspace, onOpenCodeStory, onJumpToTurn }: { turns: Turn[], workspace?: WorkspaceProject, onOpenCodeStory: () => void, onJumpToTurn: (turn: Turn) => void }) => {
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null);
   const [selectedTurnIds, setSelectedTurnIds] = useState<string[]>([]);
   const [isBatchReviewOpen, setIsBatchReviewOpen] = useState(false);
@@ -2806,7 +2960,16 @@ const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], work
           sortedTurns.map((turn) => (
             <div 
               key={turn.id}
-              onClick={() => setSelectedTurn(turn)}
+              onClick={() => {
+                console.log('[ReviewDock jump] card click', {
+                  id: turn.id,
+                  anchorId: turn.anchorId,
+                  title: turn.taskTitle,
+                  text: turn.userMessage.slice(0, 120)
+                });
+                onJumpToTurn(turn);
+                setSelectedTurn(turn);
+              }}
               className={`group cursor-pointer border rounded-lg p-3 transition-all relative overflow-hidden ${
                 selectedTurnIds.includes(turn.id)
                   ? 'border-blue-500 bg-blue-500/10 shadow-[inset_0_0_0_1px_rgba(59,130,246,0.2)]'
@@ -2832,17 +2995,35 @@ const RightPanel = ({ turns, workspace, onOpenCodeStory }: { turns: Turn[], work
               <p className="text-xs text-on-surface line-clamp-2 relative z-10">"{turn.userMessage}"</p>
               <div className="mt-3 flex items-center justify-between border-t border-slate-800 pt-2 text-[9px] font-bold uppercase tracking-widest">
                 <span className="text-slate-600">{turn.modifiedFiles.length} changed file{turn.modifiedFiles.length === 1 ? '' : 's'}</span>
-                <button
-                  type="button"
-                  onClick={(event) => toggleSelectTurn(turn.id, event)}
-                  className={`rounded border px-2 py-1 transition-colors ${
-                    selectedTurnIds.includes(turn.id)
-                      ? 'border-blue-400/60 bg-blue-500/15 text-blue-200'
-                      : 'border-slate-700 text-slate-500 hover:border-blue-500 hover:text-blue-300'
-                  }`}
-                >
-                  {selectedTurnIds.includes(turn.id) ? '已选择' : '选择此对话'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      console.log('[ReviewDock jump] locate button click', {
+                        id: turn.id,
+                        anchorId: turn.anchorId,
+                        title: turn.taskTitle,
+                        text: turn.userMessage.slice(0, 120)
+                      });
+                      onJumpToTurn(turn);
+                    }}
+                    className="rounded border border-slate-700 px-2 py-1 text-slate-500 transition-colors hover:border-emerald-500 hover:text-emerald-300"
+                  >
+                    定位
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(event) => toggleSelectTurn(turn.id, event)}
+                    className={`rounded border px-2 py-1 transition-colors ${
+                      selectedTurnIds.includes(turn.id)
+                        ? 'border-blue-400/60 bg-blue-500/15 text-blue-200'
+                        : 'border-slate-700 text-slate-500 hover:border-blue-500 hover:text-blue-300'
+                    }`}
+                  >
+                    {selectedTurnIds.includes(turn.id) ? '已选择' : '选择此对话'}
+                  </button>
+                </div>
               </div>
             </div>
           ))
@@ -3258,6 +3439,7 @@ const FileTextIcon = () => <span className="h-3 w-3 shrink-0 rounded-sm border b
 export default function App() {
   const [activeItem, setActiveItem] = useState<string | null>(null);
   const [selectedTurns, setSelectedTurns] = useState<string[]>([]);
+  const [jumpTarget, setJumpTarget] = useState<JumpTarget | null>(null);
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
   const [pendingSessionProjectId, setPendingSessionProjectId] = useState<string | null>(null);
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = useState<string | null>(null);
@@ -3267,6 +3449,7 @@ export default function App() {
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [sessionTurns, setSessionTurns] = useState<Record<string, Turn[]>>({});
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AgentRunStatus>>({});
+  const [mountedSessionIds, setMountedSessionIds] = useState<string[]>([]);
 
   const mapWorkspace = (workspace: ApiWorkspace): WorkspaceProject => ({
     id: workspace.id,
@@ -3306,6 +3489,11 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    if (!activeItem) return;
+    setMountedSessionIds(prev => prev.includes(activeItem) ? prev : [...prev, activeItem]);
+  }, [activeItem]);
+
   const handleAddProject = async (name: string, folderPath: string) => {
     const response = await fetch(`${API_BASE_URL}/workspaces`, {
       method: 'POST',
@@ -3322,6 +3510,7 @@ export default function App() {
     setProjects(prev => [newProject, ...prev]);
     setActiveItem(null);
     setSelectedTurns([]);
+    setJumpTarget(null);
   };
 
   const handleDeleteProject = async (projectId: string) => {
@@ -3339,9 +3528,11 @@ export default function App() {
     const deletedSessionIds = new Set(project.items.map(item => item.id));
     setSessionTurns(prev => Object.fromEntries(Object.entries(prev).filter(([sessionId]) => !deletedSessionIds.has(sessionId))));
     setSessionStatuses(prev => Object.fromEntries(Object.entries(prev).filter(([sessionId]) => !deletedSessionIds.has(sessionId))));
+    setMountedSessionIds(prev => prev.filter(sessionId => !deletedSessionIds.has(sessionId)));
     if (activeItem && deletedSessionIds.has(activeItem)) {
       setActiveItem(null);
       setSelectedTurns([]);
+      setJumpTarget(null);
     }
     await loadWorkspaces();
   };
@@ -3361,9 +3552,11 @@ export default function App() {
     })));
     setSessionTurns(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => id !== sessionId)));
     setSessionStatuses(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => id !== sessionId)));
+    setMountedSessionIds(prev => prev.filter(id => id !== sessionId));
     if (activeItem === sessionId) {
       setActiveItem(null);
       setSelectedTurns([]);
+      setJumpTarget(null);
     }
   };
 
@@ -3394,16 +3587,21 @@ export default function App() {
       ...prev,
       [session.id]: []
     }));
+    setMountedSessionIds(prev => prev.includes(session.id) ? prev : [...prev, session.id]);
     setSessionStatuses(prev => ({
       ...prev,
       [session.id]: 'idle'
     }));
     setActiveItem(session.id);
     setSelectedTurns([]);
+    setJumpTarget(null);
   };
 
   const activeSession = projects.flatMap(project => project.items).find(item => item.id === activeItem);
   const activeProject = projects.find(project => project.items.some(item => item.id === activeItem));
+  const mountedSessions = mountedSessionIds
+    .map(sessionId => projects.flatMap(project => project.items).find(item => item.id === sessionId))
+    .filter((session): session is WorkspaceItem => !!session);
   const pendingSessionProject = projects.find(project => project.id === pendingSessionProjectId);
   const pendingDeleteProject = projects.find(project => project.id === pendingDeleteProjectId);
 
@@ -3413,6 +3611,7 @@ export default function App() {
     
     const newTurn: Turn = {
       id: `turn-${(sessionTurns[activeItem]?.length || 0) + 1}`,
+      anchorId: `terminal-local-turn-${(sessionTurns[activeItem]?.length || 0) + 1}`,
       userMessage: message,
       taskTitle: fallbackTitle,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
@@ -3465,6 +3664,7 @@ export default function App() {
     const userTurns = turns.length > 0
       ? turns.map((turn): Turn => ({
           id: turn.id,
+          anchorId: `terminal-turn-${turn.id}`,
           userMessage: turn.prompt,
           taskTitle: turn.taskTitle || (turn.prompt.length > 24 ? turn.prompt.slice(0, 24) : turn.prompt),
           timestamp: new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
@@ -3485,6 +3685,7 @@ export default function App() {
         .filter((message) => message.role === 'user')
         .map((message, index): Turn => ({
           id: message.id || `turn-${index + 1}`,
+          anchorId: `terminal-turn-${message.id || `turn-${index + 1}`}`,
           userMessage: message.content,
           taskTitle: message.taskTitle || (message.content.length > 24 ? message.content.slice(0, 24) : message.content),
           timestamp: new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
@@ -3498,8 +3699,8 @@ export default function App() {
 
     setSessionTurns(prev => ({
       ...prev,
-      [sessionId]: userTurns
-    }));
+        [sessionId]: userTurns
+      }));
   };
 
   const handleRunStatusChange = (sessionId: string, status: AgentRunStatus) => {
@@ -3515,10 +3716,13 @@ export default function App() {
       <div className="flex-1 flex overflow-hidden">
         <WorkspacePane
           activeItem={activeItem}
-          setActiveItem={(id) => { setActiveItem(id); setSelectedTurns([]); }}
+          setActiveItem={(id) => { setActiveItem(id); setSelectedTurns([]); setJumpTarget(null); }}
           projects={projects}
           sessionStatuses={sessionStatuses}
-          onNewSession={setPendingSessionProjectId}
+          onNewSession={(projectId) => {
+            setJumpTarget(null);
+            setPendingSessionProjectId(projectId);
+          }}
           onOpenAddProject={() => setIsAddProjectOpen(true)}
           onDeleteProject={(projectId) => {
             setDeleteError('');
@@ -3529,38 +3733,54 @@ export default function App() {
           }}
         />
         <main className="flex-1 min-h-0 ml-64 mr-80 overflow-hidden flex flex-col relative bg-slate-950/20">
-          <AnimatePresence mode="wait">
-            {activeItem ? (
-              <motion.div 
-                key={activeItem}
-                initial={{ opacity: 0, scale: 0.99 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.99 }}
-                transition={{ duration: 0.2 }}
-                className="flex-1 min-h-0 flex flex-col"
-              >
-                <TerminalBlock 
-                  sessionId={activeItem}
-                  title={activeSession?.name || activeItem.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
-                  provider={activeSession?.provider || 'codex'}
-                  onRunCommand={handleNewTurn}
-                  onTaskTitle={handleTaskTitle}
-                  onMessagesLoaded={handleMessagesLoaded}
-                  onRunStatusChange={handleRunStatusChange}
-                />
-              </motion.div>
-            ) : (
-              <div className="flex-1 flex flex-col items-center justify-center opacity-30 select-none">
-                <Terminal size={64} className="mb-4" />
-                <p className="text-sm font-display uppercase tracking-widest">Select a terminal session from the explorer</p>
-              </div>
-            )}
-          </AnimatePresence>
+          {activeItem ? (
+            mountedSessions.map((session) => {
+              const isActive = session.id === activeItem;
+              return (
+                <div
+                  key={session.id}
+                  className={`absolute inset-0 min-h-0 flex-col ${isActive ? 'flex' : 'hidden'}`}
+                  aria-hidden={!isActive}
+                >
+                  <TerminalBlock
+                    sessionId={session.id}
+                    title={session.name || session.id.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
+                    provider={session.provider || 'codex'}
+                    onRunCommand={handleNewTurn}
+                    onTaskTitle={handleTaskTitle}
+                    onMessagesLoaded={handleMessagesLoaded}
+                    onRunStatusChange={handleRunStatusChange}
+                    jumpTarget={isActive ? jumpTarget : null}
+                  />
+                </div>
+              );
+            })
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center opacity-30 select-none">
+              <Terminal size={64} className="mb-4" />
+              <p className="text-sm font-display uppercase tracking-widest">Select a terminal session from the explorer</p>
+            </div>
+          )}
         </main>
         <RightPanel
           turns={sessionTurns[activeItem || ''] || []}
           workspace={activeProject}
           onOpenCodeStory={() => setIsCodeStoryOpen(true)}
+          onJumpToTurn={(turn) => {
+            const nextTarget = {
+              anchorId: turn.anchorId || `terminal-turn-${turn.id}`,
+              turnId: turn.id,
+              text: turn.userMessage,
+              nonce: Date.now()
+            };
+            console.log('[ReviewDock jump] set jump target', {
+              nextTarget,
+              activeItem,
+              activeSession: activeSession?.name,
+              turnsCount: sessionTurns[activeItem || '']?.length || 0
+            });
+            setJumpTarget(nextTarget);
+          }}
         />
       </div>
       <AnimatePresence>

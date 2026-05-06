@@ -1,0 +1,12 @@
+{
+  "name": "code-review-helper",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "./start-dev.sh",
+    "build": "cd website && pnpm run build && cd ../backend && pnpm run build",
+    "start": "cd backend && pnpm run start",
+    "dev:backend": "cd backend && pnpm run dev",
+    "dev:website": "cd website && pnpm run dev"
+  }
+}
