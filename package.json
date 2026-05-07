@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "scripts": {
     "dev": "./start-dev.sh",
+    "dev:win": "powershell -ExecutionPolicy Bypass -File ./start-dev.ps1",
     "build": "cd website && pnpm run build && cd ../backend && pnpm run build",
     "start": "cd backend && pnpm run start",
     "dev:backend": "cd backend && pnpm run dev",
