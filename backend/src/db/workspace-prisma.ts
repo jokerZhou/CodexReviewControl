@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
 import { prisma } from './prisma.js';
 import { PrismaClient as WorkspacePrismaClient } from '../../node_modules/.prisma/workspace-client/index.js';
 
@@ -19,7 +18,12 @@ interface WorkspaceContext {
 
 const clients = new Map<string, WorkspacePrismaClient>();
 
-const sqliteUrl = (path: string) => pathToFileURL(path).toString();
+/**
+ * 改动说明（v1.0.14）：
+ * Prisma 的 SQLite 数据源更稳定的写法是 `file:${absolutePath}`，而不是 `file://` URL。
+ * 在 Windows 某些路径场景下，`file://` URL 可能触发 SQLite Error 14（Unable to open database file）。
+ */
+const sqliteUrl = (path: string) => `file:${path}`;
 
 const addColumnIfMissing = async (db: WorkspacePrismaClient, table: string, column: string, definition: string) => {
   const columns = await db.$queryRawUnsafe<Array<{ name: string }>>(`PRAGMA table_info("${table}")`);
@@ -173,6 +177,12 @@ export const getWorkspacePrisma = async (workspacePath: string) => {
   if (cached) return cached;
 
   await mkdir(reviewdockDir(workspacePath), { recursive: true });
+  await mkdir(dirname(dbPath), { recursive: true });
+  /**
+   * 改动说明：
+   * 预先 touch 一次数据库文件，避免目标路径在部分 Windows 环境下由 SQLite 首次创建失败。
+   */
+  await writeFile(dbPath, '', { flag: 'a' });
   const db = new WorkspacePrismaClient({
     datasources: {
       db: {

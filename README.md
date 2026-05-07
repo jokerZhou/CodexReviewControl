@@ -55,6 +55,19 @@ cd backend
 pnpm run db:generate
 ```
 
+If backend requests fail with `Environment variable not found: DATABASE_URL`, create `backend/.env` from `backend/.env.example`, or set:
+
+```powershell
+DATABASE_URL="file:./prisma/dev.db"
+```
+
+If backend returns `Origin ... is not allowed` or `/workspaces` returns `500` when frontend uses a LAN IP origin, set:
+
+```powershell
+WEBSITE_ORIGIN="http://localhost:3000"
+CORS_ALLOWED_ORIGINS="http://192.168.30.1:3000,http://192.168.31.137:3000"
+```
+
 Useful root scripts:
 
 ```bash

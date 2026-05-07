@@ -41,6 +41,12 @@ import { motion, AnimatePresence } from 'motion/react';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
 const API_WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
+/**
+ * 改动说明：
+ * - Windows 原生目录弹窗可能需要用户花更久时间浏览目录树。
+ * - 将前端请求超时由 12 秒提高到 180 秒，避免用户尚未完成选择就被前端提前中断。
+ */
+const SELECT_DIRECTORY_REQUEST_TIMEOUT_MS = 180_000;
 console.log('[ReviewDock jump] diagnostics enabled');
 
 const formatRunDuration = (ms: number) => {
@@ -778,10 +784,19 @@ const AddProjectModal = ({ onClose, onAddProject }: { onClose: () => void, onAdd
   const [error, setError] = useState('');
 
   const handleFolderSelect = async () => {
+    /**
+     * 改动说明：
+     * - 为 /system/select-directory 增加前端超时中断，避免后端目录弹窗异常时请求长期 pending。
+     * - 超时或网络失败后自动降级到浏览器目录选择器，确保用户操作可继续。
+     */
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), SELECT_DIRECTORY_REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(`${API_BASE_URL}/system/select-directory`, {
-        method: 'POST'
+        method: 'POST',
+        signal: controller.signal
       });
+      window.clearTimeout(timeoutId);
 
       if (response.status === 204) return;
 
@@ -791,8 +806,10 @@ const AddProjectModal = ({ onClose, onAddProject }: { onClose: () => void, onAdd
         setError('');
         return;
       }
-    } catch {
-      // Fall through to browser directory picker when the local backend is unavailable.
+    } catch (fetchError) {
+      window.clearTimeout(timeoutId);
+      // 仅在最终无法完成选择时显示错误，避免用户仍在操作时出现“过快失败”提示。
+      // Fall through to browser directory picker when backend is unavailable or request timed out.
     }
 
     if (!window.showDirectoryPicker) {

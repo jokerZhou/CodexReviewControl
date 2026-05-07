@@ -15,6 +15,28 @@ import { registerSystemRoutes } from './routes/system.js';
 import { registerTerminalRoutes } from './routes/terminal.js';
 import { registerWorkspaceRoutes } from './routes/workspaces.js';
 
+// 改动说明：允许本机与局域网调试来源，解决 Windows 下通过本机网卡 IP 访问前端时触发的 CORS 500。
+const localDevOriginPattern = /^https?:\/\/(?:localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?::\d+)?$/;
+
+const isAllowedOrigin = (origin: string | undefined): boolean => {
+  if (!origin) {
+    return true;
+  }
+
+  // 改动说明：保留既有 WEBSITE_ORIGIN 单值配置兼容性。
+  if (origin === env.websiteOrigin) {
+    return true;
+  }
+
+  // 改动说明：支持通过 CORS_ALLOWED_ORIGINS 配置多个精确来源。
+  if (env.corsAllowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  // 改动说明：默认允许常见本机/私网开发地址，减少开发期跨网卡访问失败。
+  return localDevOriginPattern.test(origin);
+};
+
 export async function buildApp() {
   const currentDir = dirname(fileURLToPath(import.meta.url));
   const websiteDistDir = resolve(currentDir, '../../website/dist');
@@ -24,7 +46,7 @@ export async function buildApp() {
 
   await app.register(cors, {
     origin: (origin, callback) => {
-      if (!origin || /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin) || origin === env.websiteOrigin) {
+      if (isAllowedOrigin(origin)) {
         callback(null, true);
         return;
       }
