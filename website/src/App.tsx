@@ -141,7 +141,7 @@ const MarkdownText = ({ text }: { text: string }) => (
   </div>
 );
 
-const CurrentTaskButton = ({ task, fallbackTitle, isRunning, durationMs }: { task: CurrentTaskInfo | null, fallbackTitle: string, isRunning: boolean, durationMs: number | null }) => {
+const CurrentTaskButton = ({ task, fallbackTitle, isRunning, durationMs, canStop = false, isStopping = false, onStop }: { task: CurrentTaskInfo | null, fallbackTitle: string, isRunning: boolean, durationMs: number | null, canStop?: boolean, isStopping?: boolean, onStop?: () => void }) => {
   const [isOpen, setIsOpen] = useState(false);
   const displayTask: CurrentTaskInfo = task || {
     title: fallbackTitle,
@@ -176,6 +176,16 @@ const CurrentTaskButton = ({ task, fallbackTitle, isRunning, durationMs }: { tas
           <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
             TIME: {displayTask.durationMs !== null && displayTask.durationMs !== undefined ? formatRunDuration(displayTask.durationMs) : '0:00'}
           </div>
+          {onStop && (
+            <button
+              type="button"
+              onClick={onStop}
+              disabled={!canStop || isStopping}
+              className="mb-2 w-full rounded border border-red-500/30 bg-red-500/10 px-2 py-2 text-[10px] font-bold uppercase tracking-widest text-red-200 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-slate-900 disabled:text-slate-600"
+            >
+              {isStopping ? 'STOPPING' : '结束当前任务'}
+            </button>
+          )}
           <div className="max-h-44 overflow-y-auto whitespace-pre-wrap rounded border border-slate-800 bg-slate-900/60 p-2 text-xs leading-relaxed text-slate-300 hide-scrollbar">
             {displayTask.prompt}
           </div>
@@ -1018,6 +1028,7 @@ const TerminalHistoryItem = ({ line, index, active = false }: { line: TerminalHi
 
 const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActive, onMessagesLoaded, onRunStatusChange }: { sessionId: string, title: string, provider: AgentProvider, providerLabel: string, isActive: boolean, onMessagesLoaded: (sessionId: string, messages: ApiMessage[], turns: ApiTurn[]) => void, onRunStatusChange: (sessionId: string, status: AgentRunStatus) => void }) => {
   const terminalRef = useRef<HTMLDivElement | null>(null);
+  const xtermRef = useRef<XTerm | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const onMessagesLoadedRef = useRef(onMessagesLoaded);
@@ -1027,6 +1038,7 @@ const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActi
   const [lastRunDurationMs, setLastRunDurationMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(Date.now());
   const [currentTask, setCurrentTask] = useState<CurrentTaskInfo | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
   const runStartedAtRef = useRef<number | null>(null);
   const isRunning = runStartedAt !== null;
   const currentRunDurationMs = runStartedAt ? nowMs - runStartedAt : lastRunDurationMs;
@@ -1056,6 +1068,7 @@ const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActi
     });
     const fitAddon = new FitAddon();
     fitAddonRef.current = fitAddon;
+    xtermRef.current = terminal;
     terminal.loadAddon(fitAddon);
     terminal.open(terminalRef.current);
     fitAddon.fit();
@@ -1176,6 +1189,7 @@ const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActi
       inputDisposable.dispose();
       resizeObserver.disconnect();
       fitAddonRef.current = null;
+      xtermRef.current = null;
       socket.close();
       terminal.dispose();
       onRunStatusChangeRef.current(sessionId, 'idle');
@@ -1192,6 +1206,25 @@ const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActi
     if (!isActive) return;
     window.setTimeout(() => fitAddonRef.current?.fit(), 0);
   }, [isActive]);
+
+  const handleStopCurrentTask = async () => {
+    if ((!isRunning && provider !== 'terminal') || isStopping) return;
+    setIsStopping(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/stop`, {
+        method: 'POST'
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to stop current task');
+      }
+      xtermRef.current?.writeln('\r\n[stop requested]');
+    } catch (error) {
+      xtermRef.current?.writeln(`\r\n[stop failed: ${error instanceof Error ? error.message : 'Failed to stop current task'}]`);
+    } finally {
+      setIsStopping(false);
+    }
+  };
 
   return (
     <div className="flex-1 min-h-0 flex flex-col gap-6 p-6">
@@ -1213,6 +1246,9 @@ const InteractiveTerminal = ({ sessionId, title, provider, providerLabel, isActi
             fallbackTitle={title}
             isRunning={isRunning}
             durationMs={currentRunDurationMs}
+            canStop={isRunning}
+            isStopping={isStopping}
+            onStop={handleStopCurrentTask}
           />
         </div>
         <span className="truncate text-slate-500 text-xs font-medium uppercase tracking-tight font-display">{title}</span>
@@ -1453,6 +1489,7 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', isActive = true, 
   const [researchConfirmEnabled, setResearchConfirmEnabled] = useState(false);
   const [askModeEnabled, setAskModeEnabled] = useState(false);
   const [pendingResearch, setPendingResearch] = useState<ResearchPlanResponse['researchPlan'] | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
   const providerLabel = providerMeta[provider].label;
   const isCodexCli = provider === 'codex-cli';
   const isInteractiveTerminal = provider === 'codex-cli' || provider === 'terminal';
@@ -1999,6 +2036,33 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', isActive = true, 
     }
   };
 
+  const handleStopCurrentTask = async () => {
+    if (!isRunning || isStopping) return;
+    setIsStopping(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/stop`, {
+        method: 'POST'
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || 'Failed to stop current task');
+      }
+      setHistory(prev => [...prev, {
+        type: 'info',
+        text: '[stop requested] Interrupt signal sent to current task.',
+        color: 'text-amber-300'
+      }]);
+    } catch (error) {
+      setHistory(prev => [...prev, {
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to stop current task',
+        color: 'text-error'
+      }]);
+    } finally {
+      setIsStopping(false);
+    }
+  };
+
   if (isInteractiveTerminal) {
     return (
       <InteractiveTerminal
@@ -2038,6 +2102,9 @@ const TerminalBlock = ({ sessionId, title, provider = 'codex', isActive = true, 
               fallbackTitle={title}
               isRunning={isRunning}
               durationMs={currentRunDurationMs}
+              canStop={isRunning}
+              isStopping={isStopping}
+              onStop={handleStopCurrentTask}
             />
             <span className="px-2 py-1 bg-slate-800 text-slate-400 text-[10px] font-bold border border-slate-700 rounded">SESSION: {sessionId.slice(-6)}</span>
           </div>

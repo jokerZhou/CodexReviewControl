@@ -6,8 +6,9 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
-import { runAgentExplanation, runAgentTurn, runCodexResearchPlan, type AgentAttachment, type AgentExecutionMode, type CodexRunOptions, type ResearchPlanResult } from '../agents/providers.js';
+import { runAgentExplanation, runAgentTurn, runCodexResearchPlan, type AgentAttachment, type AgentExecutionMode, type AgentRunController, type CodexRunOptions, type ResearchPlanResult } from '../agents/providers.js';
 import { findSessionContext, findTurnContext, workspaceUploadsDir } from '../db/workspace-prisma.js';
+import { interruptTerminalSession } from './terminal.js';
 import { resolveCodexRunOptions } from '../services/codex-options.js';
 import { extractTaskTitle } from '../services/task-title.js';
 
@@ -18,6 +19,14 @@ const sessionParamsSchema = z.object({
 const turnParamsSchema = z.object({
   turnId: z.string().min(1)
 });
+
+type RunningAgentTask = {
+  abortController: AbortController;
+  cancel?: (reason?: string) => void;
+  turnId: string;
+};
+
+const runningAgentTasks = new Map<string, RunningAgentTask>();
 
 const sendMessageSchema = z.object({
   prompt: z.string().trim().min(1),
@@ -372,6 +381,35 @@ const buildChangeExplanationPrompt = (turn: { prompt: string; taskTitle: string 
 };
 
 export async function registerSessionRoutes(app: FastifyInstance) {
+  app.post('/sessions/:sessionId/stop', async (request, reply) => {
+    const params = sessionParamsSchema.safeParse(request.params);
+
+    if (!params.success) {
+      return reply.code(400).send({ error: 'Invalid session id', issues: params.error.issues });
+    }
+
+    const task = runningAgentTasks.get(params.data.sessionId);
+    if (task) {
+      task.cancel?.('Agent task aborted by user.');
+      task.abortController.abort(new Error('Agent task aborted by user.'));
+      return reply.code(202).send({ ok: true, turnId: task.turnId, mode: 'agent' });
+    }
+
+    const context = await findSessionContext(params.data.sessionId);
+    if (!context?.session) {
+      return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    if (context.session.provider === AgentProvider.TERMINAL || context.session.provider === AgentProvider.CODEX_CLI) {
+      const interrupted = interruptTerminalSession(params.data.sessionId);
+      if (interrupted) {
+        return reply.code(202).send({ ok: true, mode: 'terminal' });
+      }
+    }
+
+    return reply.code(409).send({ error: 'No running agent task for this session.' });
+  });
+
   app.post('/sessions/:sessionId/research', async (request, reply) => {
     const params = sessionParamsSchema.safeParse(request.params);
     const body = researchSchema.safeParse(request.body);
@@ -762,9 +800,21 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     const executionMode: AgentExecutionMode = body.askMode ? 'ask' : 'default';
     const agentPrompt = body.askMode ? buildAskModePrompt(body.prompt) : body.prompt;
     const modifiedFiles = new Map<string, { path: string; kind: 'add' | 'delete' | 'update'; beforeContent: string | null; afterContent: string | null; content: string | null }>();
+    const runAbortController = new AbortController();
+    const runController: AgentRunController = {
+      signal: runAbortController.signal,
+      registerCancel: (cancel) => {
+        const task = runningAgentTasks.get(session.id);
+        if (task?.turnId === turn.id) task.cancel = cancel;
+      }
+    };
+    runningAgentTasks.set(session.id, {
+      abortController: runAbortController,
+      turnId: turn.id
+    });
 
     try {
-      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, context.workspace.path, agentPrompt, body.attachments, body.options, executionMode)) {
+      for await (const chunk of runAgentTurn(session.provider, session.id, session.externalSessionId, context.workspace.path, agentPrompt, body.attachments, body.options, executionMode, runController)) {
         if (chunk.externalSessionId && chunk.externalSessionId !== session.externalSessionId) {
           await context.db.session.update({
             where: { id: session.id },
@@ -842,7 +892,10 @@ export async function registerSessionRoutes(app: FastifyInstance) {
 
       writeSse(reply.raw, 'done', { ok: true, turnId: turn.id });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown agent error';
+      const isAborted = runAbortController.signal.aborted;
+      const message = isAborted
+        ? 'Agent task aborted by user.'
+        : error instanceof Error ? error.message : 'Unknown agent error';
       request.log.error({
         err: error,
         sessionId: session.id,
@@ -853,7 +906,10 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         reasoningEffort: body.options.modelReasoningEffort
       }, 'Agent turn failed');
       writeSse(reply.raw, 'error', { message });
+      writeSse(reply.raw, 'status', { status: 'completed', aborted: isAborted, exitCode: 130 });
     } finally {
+      const task = runningAgentTasks.get(session.id);
+      if (task?.turnId === turn.id) runningAgentTasks.delete(session.id);
       reply.raw.end();
     }
   });

@@ -70,6 +70,13 @@ const pushOutput = (state: PtySessionState, data: string) => {
   for (const socket of state.sockets) socket.send(payload);
 };
 
+export const interruptTerminalSession = (sessionId: string) => {
+  const state = ptySessions.get(sessionId);
+  if (!state) return false;
+  state.pty.write('\u0003');
+  return true;
+};
+
 const finalizePendingTurn = async (state: PtySessionState) => {
   if (!state.pendingTurn || state.isFinalizing || state.provider !== AgentProvider.CODEX_CLI) return;
   state.isFinalizing = true;

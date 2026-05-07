@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { Codex, type ModelReasoningEffort, type ThreadEvent } from '@openai/codex-sdk';
 import type { AgentProvider } from '@prisma/client';
 
@@ -39,6 +39,11 @@ export interface ResearchPlanResult {
   files: ResearchPlannedFile[];
   confidence: 'low' | 'medium' | 'high';
   risks: string[];
+}
+
+export interface AgentRunController {
+  signal?: AbortSignal;
+  registerCancel?: (cancel: (reason?: string) => void) => void;
 }
 
 const codex = new Codex({
@@ -82,7 +87,7 @@ const formatCodexEvent = (event: ThreadEvent) => {
   }
 };
 
-async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default'): AsyncGenerator<AgentChunk> {
+async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default', controller?: AgentRunController): AsyncGenerator<AgentChunk> {
   const threadKey = `${sessionId}:${options.model}:${options.modelReasoningEffort}:${mode}`;
   let thread = codexThreads.get(threadKey);
   if (!thread) {
@@ -101,6 +106,12 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
     ? [{ type: 'text' as const, text: prompt }, ...attachments]
     : prompt;
   const abortController = new AbortController();
+  const handleExternalAbort = () => abortController.abort(controller?.signal?.reason ?? new Error('Agent task aborted by user.'));
+  if (controller?.signal) {
+    if (controller.signal.aborted) handleExternalAbort();
+    else controller.signal.addEventListener('abort', handleExternalAbort, { once: true });
+  }
+  controller?.registerCancel?.((reason) => abortController.abort(new Error(reason || 'Agent task aborted by user.')));
   const timeout = attachments.length > 0 && options.imageTurnTimeoutMs > 0
     ? setTimeout(() => abortController.abort(new Error(`Timed out waiting for Codex image analysis after ${Math.floor(options.imageTurnTimeoutMs / 1000)} seconds.`)), options.imageTurnTimeoutMs)
     : undefined;
@@ -136,6 +147,7 @@ async function* runCodexSdkTurn(sessionId: string, workspacePath: string, prompt
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
+    if (controller?.signal) controller.signal.removeEventListener('abort', handleExternalAbort);
   }
 
   yield { type: 'done', exitCode: 0 };
@@ -238,12 +250,26 @@ export const runCodexResearchPlan = async (workspacePath: string, prompt: string
   return parseResearchPlan(turn.finalResponse);
 };
 
-async function* runCursorCliTurn(workspacePath: string, prompt: string): AsyncGenerator<AgentChunk> {
+const terminateChild = (child: ChildProcess) => {
+  if (child.killed || child.exitCode !== null) return;
+  child.kill('SIGINT');
+  setTimeout(() => {
+    if (!child.killed && child.exitCode === null) child.kill('SIGKILL');
+  }, 1500).unref();
+};
+
+async function* runCursorCliTurn(workspacePath: string, prompt: string, controller?: AgentRunController): AsyncGenerator<AgentChunk> {
   const child = spawn('cursor-agent', ['-p', '--output-format', 'stream-json', prompt], {
     cwd: workspacePath,
     env: process.env,
     shell: false
   });
+  const handleExternalAbort = () => terminateChild(child);
+  if (controller?.signal) {
+    if (controller.signal.aborted) handleExternalAbort();
+    else controller.signal.addEventListener('abort', handleExternalAbort, { once: true });
+  }
+  controller?.registerCancel?.(() => terminateChild(child));
 
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
@@ -283,6 +309,7 @@ async function* runCursorCliTurn(workspacePath: string, prompt: string): AsyncGe
       yield chunk;
     }
   }
+  if (controller?.signal) controller.signal.removeEventListener('abort', handleExternalAbort);
 }
 
 const extractStringField = (value: unknown, keys: string[]): string | undefined => {
@@ -308,7 +335,7 @@ const formatCodexCliEvent = (event: unknown) => {
   return message ? `[${type ?? 'event'}] ${message}` : `[${type}]`;
 };
 
-async function* runCodexCliTurn(sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions): AsyncGenerator<AgentChunk> {
+async function* runCodexCliTurn(sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, controller?: AgentRunController): AsyncGenerator<AgentChunk> {
   const args = sessionExternalId
     ? ['exec', 'resume', '--json', '--skip-git-repo-check', '-m', options.model]
     : ['exec', '--json', '--skip-git-repo-check', '-C', workspacePath, '-m', options.model, '-s', 'workspace-write'];
@@ -327,6 +354,12 @@ async function* runCodexCliTurn(sessionExternalId: string | null | undefined, wo
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false
   });
+  const handleExternalAbort = () => terminateChild(child);
+  if (controller?.signal) {
+    if (controller.signal.aborted) handleExternalAbort();
+    else controller.signal.addEventListener('abort', handleExternalAbort, { once: true });
+  }
+  controller?.registerCancel?.(() => terminateChild(child));
 
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
@@ -394,20 +427,21 @@ async function* runCodexCliTurn(sessionExternalId: string | null | undefined, wo
       yield chunk;
     }
   }
+  if (controller?.signal) controller.signal.removeEventListener('abort', handleExternalAbort);
 }
 
-export async function* runAgentTurn(provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default'): AsyncGenerator<AgentChunk> {
+export async function* runAgentTurn(provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, attachments: AgentAttachment[] = [], options: CodexRunOptions, mode: AgentExecutionMode = 'default', controller?: AgentRunController): AsyncGenerator<AgentChunk> {
   if (provider === 'CODEX') {
-    yield* runCodexSdkTurn(sessionId, workspacePath, prompt, attachments, options, mode);
+    yield* runCodexSdkTurn(sessionId, workspacePath, prompt, attachments, options, mode, controller);
     return;
   }
 
   if (provider === 'CODEX_CLI') {
-    yield* runCodexCliTurn(sessionExternalId, workspacePath, prompt, attachments, options);
+    yield* runCodexCliTurn(sessionExternalId, workspacePath, prompt, attachments, options, controller);
     return;
   }
 
-  yield* runCursorCliTurn(workspacePath, prompt);
+  yield* runCursorCliTurn(workspacePath, prompt, controller);
 }
 
 export const runAgentExplanation = async (provider: AgentProvider, sessionId: string, sessionExternalId: string | null | undefined, workspacePath: string, prompt: string, options: CodexRunOptions): Promise<AgentExplanationResult> => {
